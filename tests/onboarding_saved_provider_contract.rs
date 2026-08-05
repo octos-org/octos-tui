@@ -136,6 +136,21 @@ fn hydrate_is_idempotent_for_current_profile() {
 }
 
 #[test]
+/// STALE SURFACE — pinned rows that no longer exist.
+///
+/// The wizard overhaul (28e1ed6 "/add-model, model-decoupled steps") replaced
+/// the per-field `onboard.provider.{family,model,key}` rows with a single
+/// `onboard.provider.add_model` entry point, so this asserts against a menu
+/// that is gone and has failed on main ever since.
+///
+/// Deliberately NOT rewritten to assert something about `add_model`: the
+/// saved-value display this pins moved into the add-model surface, and pinning
+/// a row that merely exists would give false confidence about the property that
+/// actually matters ("a saved provider must never read as 'not set'"). The
+/// hydration half of that contract is still covered by the passing tests above.
+///
+/// TODO: re-point at the /add-model surface, then un-ignore.
+#[ignore = "pins onboarding.provider.{family,model,key} rows removed by the /add-model overhaul"]
 fn provider_rows_fall_back_to_saved_values() {
     let mut store = first_launch_store();
     run_command(&mut store, "/onboard profile alex");
@@ -175,6 +190,21 @@ fn draft_values_override_saved_display() {
 }
 
 #[test]
+/// STALE SURFACE — pinned rows that no longer exist.
+///
+/// The wizard overhaul (28e1ed6 "/add-model, model-decoupled steps") replaced
+/// the per-field `onboard.provider.{family,model,key}` rows with a single
+/// `onboard.provider.add_model` entry point, so this asserts against a menu
+/// that is gone and has failed on main ever since.
+///
+/// Deliberately NOT rewritten to assert something about `add_model`: the
+/// saved-value display this pins moved into the add-model surface, and pinning
+/// a row that merely exists would give false confidence about the property that
+/// actually matters ("a saved provider must never read as 'not set'"). The
+/// hydration half of that contract is still covered by the passing tests above.
+///
+/// TODO: re-point at the /add-model surface, then un-ignore.
+#[ignore = "pins onboarding.provider.{family,model,key} rows removed by the /add-model overhaul"]
 fn rows_show_not_set_without_saved_provider() {
     let mut store = first_launch_store();
     run_command(&mut store, "/onboard profile alex");

@@ -63,6 +63,13 @@ enum RenderMode {
 
 pub fn run(cli: Cli) -> Result<()> {
     enable_raw_mode()?;
+    // Warm the one-shot terminal background probe HERE — after raw mode is on
+    // (so the OSC 11 reply isn't line-buffered or echoed) but BEFORE the input
+    // loop begins. The probe reads `/dev/tty` and discards any non-OSC bytes;
+    // running it lazily on the first frame render (via `Palette::for_theme`)
+    // would race the live event loop and swallow early keystrokes. Caching in
+    // the `OnceLock` means `for_theme` reuses this result and never re-probes.
+    let _ = crate::terminal_probe::terminal_info();
     let mut stdout = io::stdout();
     // Inline-viewport model (codex-style): we do NOT enter the alternate screen
     // for the main chat. The terminal keeps its normal scrollback, so finalized
@@ -168,9 +175,18 @@ pub fn run(cli: Cli) -> Result<()> {
         // redraw on the animation cadence so the spinner/status moves; otherwise
         // an idle UI emits no terminal writes and never wipes a live selection.
         let turn_active = store.state.run_state.is_active();
-        if turn_active && last_animation.elapsed() >= ANIMATION_INTERVAL {
-            dirty = true;
-            last_animation = Instant::now();
+        if turn_active {
+            // Watchdog: after a turn has sat parked on an operator decision past
+            // the escalation threshold, re-show a hidden prompt (never
+            // auto-resolves). The prominent banner is driven purely by elapsed
+            // time in the render pass; this handles the modal-visibility side.
+            if store.escalate_parked_decision_if_due() {
+                dirty = true;
+            }
+            if last_animation.elapsed() >= ANIMATION_INTERVAL {
+                dirty = true;
+                last_animation = Instant::now();
+            }
         }
         if dirty {
             let menu_reserved_now = app::menu_surface_active(&store.state);
@@ -292,6 +308,7 @@ where
         guard.enter_alt_screen(terminal)?;
         guard.sync_mouse_capture(terminal, app::wants_mouse_capture(&store.state))?;
         let size = terminal.size()?;
+        store.state.last_terminal_width = size.width;
         let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
         let resized = size != terminal.last_known_screen_size || terminal.viewport_area != area;
         if resized {
@@ -318,6 +335,11 @@ where
 
     let size = terminal.size()?;
     let width = size.width;
+    // Key handlers gate on the drawn width (side-by-side diff toggle) and height
+    // (Peer Dock approve/deny keys); record them on the frame that renders, so
+    // gate and render agree.
+    store.state.last_terminal_width = width;
+    store.state.last_terminal_height = size.height;
 
     // A slash/command menu is a RESERVED viewport row block (`menu_height` in
     // `render_viewport_with_finalization`), not a floating overlay. Opening it
@@ -728,9 +750,16 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
     }
 
     if is_control_char(&key, 'c') {
-        return store
-            .interrupt_command()
-            .map_or(KeyAction::Continue, KeyAction::send);
+        // A turn parked on a decision (approval / question) can be waiting BEFORE
+        // any reply streams, so `active_turn()` — hence `interrupt_command()` —
+        // is a no-op there. Route through the decision-aware interrupt so Ctrl+C
+        // reliably cancels a parked turn (and tears down its server-side waiter).
+        let command = if app::active_session_has_pending_decision(&store.state) {
+            store.interrupt_active_decision_command()
+        } else {
+            store.interrupt_command()
+        };
+        return command.map_or(KeyAction::Continue, KeyAction::send);
     }
 
     // A live sub-agent peek OWNS the keyboard, exactly like a modal: routed here
@@ -773,13 +802,30 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         return KeyAction::Continue;
     }
 
+    // Ctrl+P folds/unfolds the ◆ Goal banner objective. A huge pasted objective
+    // (e.g. shader code) folds to one compact preview row by default; Ctrl+P
+    // expands it (and re-folds). Only claimed while the active session has a
+    // goal — otherwise the key falls through unswallowed so it stays free.
+    // (Ctrl+P — Ctrl+G collides with browser bindings, Ctrl+E is the composer's
+    // cursor-to-end-of-line, and Alt/Option+E is a dead accent key on macOS
+    // unless "Option as Meta" is enabled. Ctrl+P is free and works everywhere.)
+    if is_control_char(&key, 'p') && app::active_session_has_goal(&store.state) {
+        store.state.toggle_goal_objective_fold();
+        return KeyAction::Continue;
+    }
+
     // Modified-key composer edits are gated on no modal owning the keyboard:
     // the approval/question modals force-focus the composer, so without the
     // gate Ctrl+W / Alt+b / Shift+Enter kept mutating the hidden draft while a
     // dialog was up. Menus are NOT gated here — `handle_menu_key` routes to
-    // `handle_composer_modified_key` itself where composer editing is intended.
+    // `handle_composer_modified_key` itself where composer editing is intended
+    // — EXCEPT the `@` file picker: its Esc-restore contract ("delete the
+    // trigger `@`, composer back to its pre-`@` text") relies on the composer
+    // being frozen while the picker is up, so a Ctrl+W leaking through here
+    // would silently mutate the hidden draft and break the restore (#363).
     if store.state.focus == FocusPane::Composer
         && !modal_owns_keyboard(store)
+        && store.state.file_picker.is_none()
         && handle_composer_modified_key(store, key)
     {
         return KeyAction::Continue;
@@ -806,7 +852,7 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         return handle_plain_key(store, key);
     }
 
-    if is_alt_char(&key, 'a') {
+    if is_alt_char(&key, 'a') || is_ctrl_char(&key, 'r') {
         // Recovery key: re-open a hidden pending modal so an accidental Esc never
         // wedges the turn (DO-NOT-SHIP #1). Precedence is deterministic — a hidden
         // question is re-shown FIRST, since a pending AskUserQuestion blocks the
@@ -829,15 +875,119 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         return KeyAction::Continue;
     }
 
-    // Agent Dock (#323): Alt+G toggles the sub-agent strip between the
+    // Agent Dock (#323): Ctrl+G/Alt+G toggles the sub-agent strip between the
     // one-line summary pill and the per-agent rows. NOT Alt+D — the composer
     // claims that as readline delete-word-forward (handle_composer_modified_key
     // runs first while the composer has focus, mini4 soak catch). Only claimed
     // while a roster exists — with no agents the strip is height-0 and the key
     // stays free.
-    if is_alt_char(&key, 'g') && !store.state.active_session_agents().is_empty() {
+    if (is_alt_char(&key, 'g') || is_ctrl_char(&key, 'g'))
+        && !store.state.active_session_agents().is_empty()
+    {
         store.state.agent_dock_collapsed = !store.state.agent_dock_collapsed;
         return KeyAction::Continue;
+    }
+
+    // #407: Alt+P / Ctrl+L — toggle the Peer Dock's collapsed state. Mirrors
+    // Alt+G / Ctrl+G (agent dock) and Alt+S / Ctrl+S (sessions): Alt+P is the
+    // primary bind (P = peer), with a Ctrl alias for terminals where Option
+    // doesn't send Meta. The alias is Ctrl+L — NOT Ctrl+J (that is the
+    // composer's portable newline, handled in `handle_composer_modified_key`
+    // which runs BEFORE this arm, so a Ctrl+J bind here was dead) and NOT
+    // Ctrl+P (that is the Goal-banner fold). Ctrl+L is the one genuinely-free
+    // Ctrl letter left after #408: unbound in both the global arms above and
+    // the composer readline map. Gated exactly like the #817 composer arm — no
+    // modal or `@` file picker owning the keyboard — so the toggle can't fire
+    // behind an approval/question dialog or the picker. Only claimed when peers
+    // exist (durable `peer_session_meta` roster, not the transient
+    // `pending_peer_kickoffs` — review F1/F3) so the keys stay free for
+    // single-session users.
+    if (is_alt_char(&key, 'p') || is_ctrl_char(&key, 'l'))
+        && !store.state.peer_session_meta.is_empty()
+        && !modal_owns_keyboard(store)
+        && store.state.file_picker.is_none()
+    {
+        store.state.peer_dock_collapsed = !store.state.peer_dock_collapsed;
+        return KeyAction::Continue;
+    }
+
+    // Peer operator console: when a peer's `[Alt+Y approve · Alt+N deny]`
+    // affordance is ACTUALLY DRAWN this frame, Alt+Y approves / Alt+N denies the
+    // TOPMOST such peer — addressed to that peer's own session, so the operator
+    // answers it WITHOUT switching to the peer. Three visibility guards keep the
+    // key from acting on an affordance the user can't see:
+    //   1. no full-screen overlay / inspector covering the dock;
+    //   2. no modal or `@` picker owning the keyboard;
+    //   3. the peer's row is on screen at the CURRENT terminal height —
+    //      `first_blocked_peer_with_approval` returns None for a collapsed,
+    //      height-0, or below-the-row-cap peer.
+    // The height is queried LIVE (not the cached `last_terminal_height`) so a
+    // resize in the same input batch as the keypress can't act on a row that
+    // just moved off-screen; the cached value is the fallback when the query
+    // fails (e.g. headless CI). Alt (not plain y/n) so a peer-focused composer's
+    // typed text is untouched.
+    if (is_alt_char(&key, 'y') || is_alt_char(&key, 'n'))
+        && !modal_owns_keyboard(store)
+        && store.state.file_picker.is_none()
+        && !app::wants_fullscreen_overlay(&store.state)
+    {
+        let terminal_height = crossterm::terminal::size()
+            .map(|(_cols, rows)| rows)
+            .unwrap_or(store.state.last_terminal_height);
+        if let Some(peer) = store
+            .state
+            .first_blocked_peer_with_approval(terminal_height)
+        {
+            let action = if is_alt_char(&key, 'y') {
+                ApprovalModalAction::ApproveRequest
+            } else {
+                ApprovalModalAction::DenyRequest
+            };
+            if let Some(command) = store.respond_peer_approval_command(&peer, action) {
+                return KeyAction::send(command);
+            }
+            return KeyAction::Continue;
+        }
+    }
+
+    // #324: Ctrl+S/Alt+S — the session switcher popup (open sessions with live-turn
+    // and unread annotations). Only claimed with 2+ sessions so the key stays
+    // free for single-session users. `handle_key` runs BEFORE the menu-active
+    // routing, so without a guard a repeated Ctrl+S kept pushing duplicate
+    // MENU_SESSIONS frames ("sessions / sessions / …"). Make it a TOGGLE and
+    // never fire behind an approval/question modal.
+    if (is_alt_char(&key, 's') || is_ctrl_char(&key, 's'))
+        && store.state.sessions.len() >= 2
+        && !modal_owns_keyboard(store)
+    {
+        let sessions_menu_open = store
+            .state
+            .menu_stack
+            .active()
+            .is_some_and(|frame| frame.id.as_str() == crate::menu::registry::MENU_SESSIONS);
+        if sessions_menu_open {
+            // Second press dismisses the switcher instead of stacking a frame.
+            store.close_all_menus();
+            return KeyAction::Continue;
+        }
+        // Open only from a clean state; if a DIFFERENT menu owns the keyboard,
+        // fall through so that menu handles the key.
+        if !store.state.menu_stack.is_active() {
+            store.open_menu(crate::menu::MenuId::from(
+                crate::menu::registry::MENU_SESSIONS,
+            ));
+            // Return-to-parent: opening the switcher from a peer pre-highlights the
+            // parent (first main/non-peer session), so Ctrl+S → Enter drops you
+            // home. `open_menu` already advanced the cursor to the first selectable
+            // row; override it to the parent (which is selectable — it isn't the
+            // focused peer). No-op when not on a peer.
+            if let Some(parent_idx) = store.state.parent_session_row_index() {
+                if let Some(frame) = store.state.menu_stack.active_mut() {
+                    frame.selected_index = parent_idx;
+                }
+            }
+            return KeyAction::Continue;
+        }
     }
 
     KeyAction::Continue
@@ -906,7 +1056,7 @@ fn handle_paste(store: &mut Store, text: &str) -> KeyAction {
     // beginning with '/' is not a command. Unlike a typed leading '/', we do
     // not open the slash-command menu here. (Regression: pasting a path
     // opened/ran the slash menu.)
-    store.state.insert_composer_text(&text);
+    store.state.insert_pasted_text(&text);
     store.state.focus = FocusPane::Composer;
 
     // Only keep an ALREADY-open slash search in sync (e.g. the user typed '/' to
@@ -1045,12 +1195,12 @@ fn is_invisible_format_char(c: char) -> bool {
 /// already handled upstream in `handle_key`; every other key is swallowed so it
 /// can't reach the composer hidden behind the overlay.
 fn handle_agent_peek_key(store: &mut Store, key: KeyEvent) -> KeyAction {
-    // Alt+A stays a global recovery valve even while peeking: re-show a hidden
+    // Ctrl+R/Alt+A stays a global recovery valve even while peeking: re-show a hidden
     // pending question/approval. A hidden modal does NOT make the peek yield
     // (nothing is visible to render), so without this the peek would swallow the
     // one key that recovers it. Once re-shown the modal is visible, the peek
     // yields, and the modal owns the keyboard.
-    if is_alt_char(&key, 'a') {
+    if is_alt_char(&key, 'a') || is_ctrl_char(&key, 'r') {
         if !store.show_pending_user_question() {
             store.show_pending_approval();
         }
@@ -1192,6 +1342,12 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         // inspection pane (codex final-gate P2).
         KeyCode::Esc if store.state.focus != FocusPane::Composer => {
             store.state.focus = FocusPane::Composer;
+        }
+        // Shell-escape mode (#364): Esc cancels the `!` draft — never runs it,
+        // never interrupts the turn. The NEXT Esc (composer now plain/empty)
+        // falls through to the ordinary interrupt semantics below.
+        KeyCode::Esc if store.shell_escape_mode_active() => {
+            store.cancel_shell_escape_mode();
         }
         KeyCode::Esc => {
             if store.state.active_turn().is_some() {
@@ -1358,13 +1514,16 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         {
             store.stage_selected_diff_context();
         }
+        KeyCode::Char('v')
+            if store.state.focus != FocusPane::Composer && store.state.diff_preview.active =>
+        {
+            store.toggle_diff_view_mode();
+        }
         KeyCode::Char(ch) => {
-            let opens_slash_popup = ch == '/' && store.state.composer.is_empty();
-            store.state.insert_composer_char(ch);
-            store.state.focus = FocusPane::Composer;
-            if opens_slash_popup {
-                store.open_menu(crate::menu::MenuId::from(crate::menu::registry::MENU_HELP));
-            }
+            // Store-level composer input: inserts the char and runs the prefix
+            // triggers (`/` slash popup, `!` shell-escape hint #364, `@` file
+            // picker #363) so the trigger decisions stay store-testable.
+            store.handle_composer_char_input(ch);
         }
         _ => {}
     }
@@ -1586,6 +1745,19 @@ fn handle_composer_vim_key(store: &mut Store, key: &KeyEvent) -> Option<KeyActio
         return Some(KeyAction::Continue);
     }
 
+    // `!` on an EMPTY composer is the shell-escape trigger (#364), not vim
+    // text entry: fall through (None) so the plain-char arm runs the prefix
+    // trigger (inserts the `!`, surfaces the cwd hint), and flip to Insert so
+    // the command text can be typed — mirroring the plain-composer flow.
+    // Normal mode swallowing it made `!` silently dead for vim users after
+    // any reflexive Esc ("`!` stopped working"). Only on empty: mid-text `!`
+    // stays a swallowed Normal-mode key (text entry requires Insert), and a
+    // pending operator above still owns the key (`d!` never triggers).
+    if c == '!' && store.state.composer.is_empty() {
+        store.state.composer_mode = ComposerMode::Insert;
+        return None;
+    }
+
     match c {
         // Motions.
         'h' => store.state.move_composer_cursor_left(),
@@ -1748,6 +1920,11 @@ fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
     }
 
     match key.code {
+        // `@` file picker (#363): Esc closes WITHOUT inserting and removes the
+        // auto-typed `@`, restoring the composer to its pre-`@` text.
+        KeyCode::Esc if file_picker_menu_active(store) => {
+            store.cancel_composer_file_picker();
+        }
         KeyCode::Esc => {
             // Esc on the slash popup dismisses its composer draft too (the
             // token that opened/filtered it — codex's dismiss semantics).
@@ -1780,6 +1957,12 @@ fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         }
         KeyCode::Backspace if active_menu_search_has_query(store) => {
             delete_active_menu_search_prev_char(store);
+        }
+        // Backspacing past an EMPTY picker filter deletes the `@` that opened
+        // it and closes the picker — the same dismiss the slash popup performs
+        // when the bare `/` is backspaced away.
+        KeyCode::Backspace if file_picker_menu_active(store) => {
+            store.cancel_composer_file_picker();
         }
         KeyCode::Char(ch) if slash_help_should_capture_char(store, ch) => {
             store.state.insert_composer_char(ch);
@@ -1830,6 +2013,19 @@ fn menu_composer_edit_active(store: &Store) -> bool {
         // `slash_help_should_capture_char` and syncs the search query, matching
         // codex's inline `/` behaviour.
         && !slash_help_capture_active(store)
+        // The `@` file picker freezes the composer the same way: the draft
+        // holds real prompt text (plus the `@` trigger), but every keystroke
+        // belongs to the picker's search filter until it closes.
+        && !file_picker_menu_active(store)
+}
+
+/// True while the `@` composer file picker (#363) is the active menu frame.
+fn file_picker_menu_active(store: &Store) -> bool {
+    store
+        .state
+        .menu_stack
+        .active()
+        .is_some_and(|frame| frame.id.as_str() == crate::menu::registry::MENU_FILE_PICKER)
 }
 
 /// True whenever the slash popup is open and the composer is a slash draft
@@ -1915,7 +2111,12 @@ fn sync_slash_help_search_query(store: &mut Store) {
 
 fn active_menu_should_capture_search_char(store: &Store, ch: char) -> bool {
     active_menu_searchable(store)
-        && (active_menu_search_has_query(store) || !matches!(ch, 'j' | 'k'))
+        && (active_menu_search_has_query(store)
+            // File names legitimately start with j/k (`justfile`,
+            // `keymap.rs`): in the `@` picker every printable char filters
+            // from the first keystroke; Up/Down still navigate.
+            || file_picker_menu_active(store)
+            || !matches!(ch, 'j' | 'k'))
 }
 
 /// Index of the ENABLED item in the active (search-filtered) menu spec whose
@@ -1981,6 +2182,14 @@ fn delete_active_menu_search_prev_char(store: &mut Store) {
 fn handle_approval_modal_key(store: &mut Store, key: KeyEvent) -> KeyAction {
     match key.code {
         KeyCode::Esc => {
+            // A parked decision: Esc INTERRUPTS the turn in ONE press (the user
+            // traded the peek-behind-the-card affordance for a reliable escape),
+            // mirroring Ctrl+C. The server-side interrupt drops the parked
+            // approval waiter so no zombie decision is left. Falls back to hiding
+            // the card only when there is no parked turn to interrupt.
+            if let Some(command) = store.interrupt_active_decision_command() {
+                return KeyAction::send(command);
+            }
             store.close_modal();
         }
         KeyCode::Char(ch) if ch.eq_ignore_ascii_case(&'y') => {
@@ -2008,6 +2217,9 @@ fn handle_approval_modal_key(store: &mut Store, key: KeyEvent) -> KeyAction {
                 return KeyAction::send(command);
             }
         }
+        KeyCode::Char(ch) if ch.eq_ignore_ascii_case(&'v') && store.state.diff_preview.active => {
+            store.toggle_diff_view_mode();
+        }
         _ => {}
     }
 
@@ -2016,10 +2228,17 @@ fn handle_approval_modal_key(store: &mut Store, key: KeyEvent) -> KeyAction {
 
 /// UPCR-2026-023: drive the AskUserQuestion picker. Keyboard model mirrors the
 /// multi-select menu (Up/Down move, Space toggle) plus typing-to-Other and
-/// Enter to step questions / submit. Esc hides the picker without answering.
+/// Enter to step questions / submit. Esc INTERRUPTS the parked turn in one press
+/// (mirroring Ctrl+C), cancelling the question rather than merely hiding it.
 fn handle_user_question_key(store: &mut Store, key: KeyEvent) -> KeyAction {
     match key.code {
         KeyCode::Esc => {
+            // One-press interrupt of the turn parked on this question; the
+            // server-side interrupt drops the parked question waiter. Falls back
+            // to hiding only when there is no parked turn to interrupt.
+            if let Some(command) = store.interrupt_active_decision_command() {
+                return KeyAction::send(command);
+            }
             store.close_modal();
         }
         KeyCode::Up => store.user_question_cursor_up(),
@@ -2336,6 +2555,19 @@ fn is_control_char(key: &KeyEvent, expected: char) -> bool {
     )
 }
 
+/// Ctrl-based twin for the Alt surface binds: macOS Option only sends Alt
+/// when the terminal is configured for it (Option-as-Meta / Esc+), so every
+/// Alt surface bind gets a Ctrl alias that works on all platforms out of the
+/// box. Raw mode disables IXON, so Ctrl+S is deliverable too.
+fn is_ctrl_char(key: &KeyEvent, expected: char) -> bool {
+    matches!(
+        key.code,
+        KeyCode::Char(ch)
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && ch.eq_ignore_ascii_case(&expected)
+    )
+}
+
 fn is_alt_char(key: &KeyEvent, expected: char) -> bool {
     matches!(
         key.code,
@@ -2624,6 +2856,191 @@ mod tests {
         }
     }
 
+    fn store_with_one_peer() -> Store {
+        let mut store = store_with_sessions(1);
+        store.state.peer_session_meta.insert(
+            SessionKey("local:tui#peer-ci-red".into()),
+            crate::model::PeerMeta {
+                slug: "ci-red".into(),
+                brief_path: "/tmp/brief.md".into(),
+                agent_staged: false,
+                created: std::time::Instant::now(),
+                finished_at: None,
+            },
+        );
+        store.state.focus = FocusPane::Composer;
+        store
+    }
+
+    /// #407 review P1: the dock toggle must fire on its ACTUAL bind (Alt+P and
+    /// the Ctrl+L alias) — NOT Ctrl+J, which the composer eats as a newline.
+    #[test]
+    fn peer_dock_toggle_flips_on_alt_p_and_ctrl_l() {
+        for chord in [
+            modified_key(KeyCode::Char('p'), KeyModifiers::ALT),
+            modified_key(KeyCode::Char('l'), KeyModifiers::CONTROL),
+        ] {
+            let mut store = store_with_one_peer();
+            let before = store.state.peer_dock_collapsed;
+            assert!(matches!(handle_key(&mut store, chord), KeyAction::Continue));
+            assert_ne!(
+                store.state.peer_dock_collapsed, before,
+                "the dock toggle must flip on {chord:?}"
+            );
+        }
+    }
+
+    /// Peer operator console (BUG C): Alt+Y answers a peer's stashed approval
+    /// from the dock — but ONLY when the peer's `[Alt+Y approve · Alt+N deny]`
+    /// affordance is actually DRAWN this frame. It fires with the dock expanded
+    /// on a normal terminal, and stays INERT (no command, stash intact) when the
+    /// dock is collapsed or a full-screen overlay covers it. (The height/row-cap
+    /// gate is exercised deterministically by the pure-function unit test
+    /// `respond_peer_approval_targets_the_peer_and_clears_the_stash`, which calls
+    /// `first_blocked_peer_with_approval` with explicit heights — here the height
+    /// is queried live, so those thresholds aren't asserted through the keybind.)
+    #[test]
+    fn peer_dock_alt_y_answers_a_drawn_peer_approval_only_when_visible() {
+        let peer = SessionKey("local:tui#peer-ci-red".into());
+        let stash = |store: &mut Store| {
+            store.state.pending_session_approvals.insert(
+                peer.clone(),
+                crate::model::ApprovalModalState::from_event(ApprovalRequestedEvent::generic(
+                    peer.clone(),
+                    ApprovalId::new(),
+                    TurnId::new(),
+                    "shell",
+                    "Run shell command?",
+                    "run: rm -rf target",
+                )),
+            );
+        };
+        let alt_y = modified_key(KeyCode::Char('y'), KeyModifiers::ALT);
+
+        // Visible: dock expanded, no overlay → the key answers the peer.
+        let mut store = store_with_one_peer();
+        stash(&mut store);
+        store.state.last_terminal_height = 24;
+        store.state.peer_dock_collapsed = false;
+        let AppUiCommand::RespondApproval(params) = sent_command(handle_key(&mut store, alt_y))
+        else {
+            panic!("expected RespondApproval");
+        };
+        assert_eq!(params.session_id, peer, "addressed to the peer's session");
+        assert_eq!(params.decision, ApprovalDecision::Approve);
+        assert!(
+            !store.state.pending_session_approvals.contains_key(&peer),
+            "the peer's stash entry is cleared once answered"
+        );
+
+        // Collapsed dock (pill only, no per-row affordance) → inert, stash intact.
+        let mut store = store_with_one_peer();
+        stash(&mut store);
+        store.state.last_terminal_height = 24;
+        store.state.peer_dock_collapsed = true;
+        assert!(matches!(handle_key(&mut store, alt_y), KeyAction::Continue));
+        assert!(
+            store.state.pending_session_approvals.contains_key(&peer),
+            "a collapsed dock shows no affordance — stash intact"
+        );
+
+        // Full-screen overlay covering the dock (e.g. the transcript pager) →
+        // inert even with a tall height, stash intact.
+        let mut store = store_with_one_peer();
+        stash(&mut store);
+        store.state.last_terminal_height = 24;
+        store.state.peer_dock_collapsed = false;
+        store.state.transcript_pager_active = true;
+        assert!(app::wants_fullscreen_overlay(&store.state));
+        assert!(matches!(handle_key(&mut store, alt_y), KeyAction::Continue));
+        assert!(
+            store.state.pending_session_approvals.contains_key(&peer),
+            "a dock hidden behind a full-screen overlay is not actionable"
+        );
+    }
+
+    /// Ctrl+S/Alt+S is a TOGGLE and must never stack duplicate MENU_SESSIONS
+    /// frames ("sessions / sessions / …" — user report): `handle_key` runs
+    /// before the menu-active routing, so an unguarded repeat kept pushing.
+    #[test]
+    fn ctrl_s_toggles_the_session_switcher_without_stacking() {
+        let mut store = store_with_sessions(2);
+        store.state.focus = FocusPane::Composer;
+        let ctrl_s = modified_key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+
+        // First press opens exactly one frame.
+        handle_key(&mut store, ctrl_s);
+        assert_eq!(store.state.menu_stack.len(), 1);
+        assert_eq!(
+            store
+                .state
+                .menu_stack
+                .active()
+                .map(|f| f.id.as_str().to_string()),
+            Some(crate::menu::registry::MENU_SESSIONS.to_string())
+        );
+
+        // Second press dismisses it — a toggle, NOT a second stacked frame.
+        handle_key(&mut store, ctrl_s);
+        assert_eq!(
+            store.state.menu_stack.len(),
+            0,
+            "a second Ctrl+S closes the switcher instead of stacking"
+        );
+
+        // Third press opens again.
+        handle_key(&mut store, ctrl_s);
+        assert_eq!(store.state.menu_stack.len(), 1);
+    }
+
+    /// #407 review P1 regression: Ctrl+J stays the composer's portable newline
+    /// even with peers open — the old bind was dead AND would have stolen it.
+    #[test]
+    fn ctrl_j_still_inserts_newline_with_peers_present() {
+        let mut store = store_with_one_peer();
+        let dock_before = store.state.peer_dock_collapsed;
+        store.state.composer = "line one".into();
+        handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('j'), KeyModifiers::CONTROL),
+        );
+        assert!(
+            store.state.composer.contains('\n'),
+            "Ctrl+J must insert a newline: {:?}",
+            store.state.composer
+        );
+        assert_eq!(
+            store.state.peer_dock_collapsed, dock_before,
+            "Ctrl+J must not toggle the dock"
+        );
+    }
+
+    /// #407 review P1: the toggle must not fire behind a modal (it would land
+    /// on the dock hidden under an approval/question dialog).
+    #[test]
+    fn peer_dock_toggle_ignored_while_modal_open() {
+        let (mut store, _) = store_with_visible_approval();
+        store.state.peer_session_meta.insert(
+            SessionKey("local:tui#peer-ci-red".into()),
+            crate::model::PeerMeta {
+                slug: "ci-red".into(),
+                brief_path: "/tmp/brief.md".into(),
+                agent_staged: true,
+                created: std::time::Instant::now(),
+                finished_at: None,
+            },
+        );
+        let before = store.state.peer_dock_collapsed;
+        handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('l'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(
+            store.state.peer_dock_collapsed, before,
+            "the dock toggle must be inert while a modal owns the keyboard"
+        );
+    }
+
     fn sample_agent_record(
         session_id: &SessionKey,
         id: &str,
@@ -2650,6 +3067,73 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 2,
         }
+    }
+
+    fn sample_goal(objective: &str) -> octos_core::ui_protocol::UiGoalRecord {
+        octos_core::ui_protocol::UiGoalRecord {
+            profile_id: Some("coding".into()),
+            goal_id: "goal_01".into(),
+            objective: objective.into(),
+            status: "active".into(),
+            token_budget: 2_000_000,
+            tokens_used: 0,
+            time_used_seconds: 0,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        }
+    }
+
+    #[test]
+    fn ctrl_p_toggles_goal_objective_fold_when_goal_present() {
+        use crate::model::GoalObjectiveFold;
+        let mut store = store_with_sessions(1);
+        let sid = store.state.active_session().unwrap().id.clone();
+        store.state.set_session_goal(
+            &sid,
+            Some(sample_goal("shader code …")),
+            Some("user".into()),
+        );
+
+        // Simulate the banner having rendered FOLDED (Auto → long objective).
+        store.state.goal_objective_folded_effective.set(true);
+        handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('p'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(
+            store.state.goal_objective_fold,
+            GoalObjectiveFold::Unfolded,
+            "Ctrl+P on a folded goal expands it",
+        );
+
+        // Simulate it now rendered UNFOLDED; Ctrl+P re-folds.
+        store.state.goal_objective_folded_effective.set(false);
+        handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('p'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(
+            store.state.goal_objective_fold,
+            GoalObjectiveFold::Folded,
+            "Ctrl+P on an unfolded goal re-folds it",
+        );
+    }
+
+    #[test]
+    fn ctrl_p_is_a_noop_without_a_goal() {
+        use crate::model::GoalObjectiveFold;
+        let mut store = store_with_sessions(1);
+        // No goal on the active session — Ctrl+P must not claim the key or
+        // mutate the fold preference.
+        handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('p'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(
+            store.state.goal_objective_fold,
+            GoalObjectiveFold::Auto,
+            "Ctrl+P without a goal leaves the fold preference untouched",
+        );
     }
 
     #[test]
@@ -2707,6 +3191,92 @@ mod tests {
         assert_eq!(store.state.chat_view, ChatViewTarget::Main);
         handle_key(&mut store, key(KeyCode::Char('z')));
         assert_eq!(store.state.composer, "z");
+    }
+
+    /// Open the `@` file picker over a fixed in-memory listing (no fs scan):
+    /// composer holds "see @" (the trigger `@` last), the picker state is set,
+    /// and the picker menu is the active frame — the exact state
+    /// `handle_composer_char_input('@')` produces.
+    fn open_file_picker(store: &mut Store) {
+        store.state.set_composer_text("see @");
+        store.state.file_picker = Some(crate::file_picker::FilePickerState {
+            root: "ws".into(),
+            files: vec!["a.rs".into()],
+            truncated: false,
+        });
+        store.open_menu(crate::menu::MenuId::from(
+            crate::menu::registry::MENU_FILE_PICKER,
+        ));
+    }
+
+    #[test]
+    fn modified_keys_leave_composer_frozen_while_file_picker_open() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        open_file_picker(&mut store);
+        assert_eq!(store.state.composer, "see @");
+
+        // #363 review: Ctrl+W must NOT reach the hidden draft while the
+        // picker owns the keyboard — it would eat the trigger `@` (and the
+        // word before it) and break Esc's exact-restore contract.
+        handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('w'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(
+            store.state.composer, "see @",
+            "composer is frozen while the picker owns the keyboard"
+        );
+
+        // Sanity: with the picker closed the same key edits the draft again —
+        // proving the freeze above came from the picker gate specifically.
+        store.cancel_composer_file_picker();
+        assert_eq!(store.state.composer, "see ");
+        handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('w'), KeyModifiers::CONTROL),
+        );
+        assert_ne!(store.state.composer, "see ");
+    }
+
+    #[test]
+    fn esc_cancels_shell_escape_draft_before_interrupting_turn() {
+        // #364 review: arm precedence — Esc on a `!` draft discards the draft
+        // and must NEVER fall through to the interrupt arm, even mid-turn.
+        let mut store = store_with_live_reply_text("working…");
+        store.state.focus = FocusPane::Composer;
+        assert!(
+            store.state.active_turn().is_some(),
+            "precondition: a turn is live, so plain Esc WOULD interrupt"
+        );
+        store.state.set_composer_text("!ls -la");
+
+        let action = handle_key(&mut store, key(KeyCode::Esc));
+        assert!(
+            matches!(action, KeyAction::Continue),
+            "first Esc cancels the draft without sending anything"
+        );
+        assert_eq!(store.state.composer, "");
+        assert!(!store.shell_escape_mode_active());
+    }
+
+    #[test]
+    fn esc_closes_file_picker_without_interrupting_turn() {
+        // #363 review: arm precedence — Esc with the picker open cancels the
+        // picker (restoring the pre-`@` draft) and never reaches the
+        // interrupt arm.
+        let mut store = store_with_live_reply_text("working…");
+        store.state.focus = FocusPane::Composer;
+        open_file_picker(&mut store);
+
+        let action = handle_key(&mut store, key(KeyCode::Esc));
+        assert!(matches!(action, KeyAction::Continue));
+        assert!(store.state.file_picker.is_none(), "picker state cleared");
+        assert_eq!(
+            store.state.composer, "see ",
+            "trigger `@` removed; draft restored to its pre-`@` text"
+        );
+        assert!(!store.state.menu_stack.is_active(), "picker frame closed");
     }
 
     #[test]
@@ -3109,7 +3679,7 @@ mod tests {
     #[test]
     fn esc_hidden_user_question_can_be_reopened_via_recovery_key() {
         // DO-NOT-SHIP #1: an accidental Esc hides the picker; the recovery key
-        // (Alt+a) must re-open it just like a hidden approval, route keys back
+        // (Ctrl+R/Alt+a) must re-open it just like a hidden approval, route keys back
         // to the picker, and let the user submit a valid response.
         let (mut store, question_id) = store_with_visible_user_question();
 
@@ -3158,6 +3728,89 @@ mod tests {
         assert_eq!(params.answers.len(), 1);
         assert_eq!(params.answers[0].selected_labels, vec!["axum".to_string()]);
         assert!(store.state.user_question.is_none());
+    }
+
+    #[test]
+    fn esc_on_a_parked_approval_interrupts_the_turn_in_one_press() {
+        // Fix 2: a turn parked on an approval can be waiting BEFORE any reply
+        // streams, so `active_turn()` (which needs a `live_reply`) is None and the
+        // plain `interrupt_command()` no-ops. Esc must STILL interrupt the parked
+        // turn — not merely hide the card (the old two-step trap) — by building
+        // the interrupt from the decision's own turn id.
+        let (mut store, _approval_id) = store_with_visible_approval();
+        let expected_session = store.state.sessions[0].id.clone();
+        let expected_turn = store
+            .state
+            .approval
+            .as_ref()
+            .expect("approval pending")
+            .turn_id
+            .clone();
+        assert!(
+            store.state.active_turn().is_none(),
+            "no live_reply: the interrupt must come from the decision's turn id"
+        );
+
+        let action = handle_key(&mut store, key(KeyCode::Esc));
+
+        let AppUiCommand::InterruptTurn(params) = sent_command(action) else {
+            panic!("Esc on a parked approval must issue an interrupt, not hide the card");
+        };
+        assert_eq!(params.session_id, expected_session);
+        assert_eq!(params.turn_id, expected_turn);
+        // The card is NOT silently hidden into the pending-but-invisible limbo: it
+        // stays until the server-side cancel lands, exactly like Ctrl+C.
+        assert!(
+            store.state.approval.as_ref().is_some_and(|a| a.visible),
+            "interrupt must not hide the card the way the old Esc did"
+        );
+    }
+
+    #[test]
+    fn esc_on_a_parked_question_interrupts_the_turn_in_one_press() {
+        // Same one-press interrupt for a parked AskUserQuestion picker.
+        let (mut store, _question_id) = store_with_visible_user_question();
+        let expected_turn = store
+            .state
+            .user_question
+            .as_ref()
+            .expect("question pending")
+            .turn_id
+            .clone();
+
+        let action = handle_key(&mut store, key(KeyCode::Esc));
+
+        let AppUiCommand::InterruptTurn(params) = sent_command(action) else {
+            panic!("Esc on a parked question must issue an interrupt, not hide the picker");
+        };
+        assert_eq!(params.turn_id, expected_turn);
+        assert!(
+            store
+                .state
+                .user_question
+                .as_ref()
+                .is_some_and(|q| q.visible),
+            "interrupt must not hide the picker the way the old Esc did"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_interrupts_a_parked_decision_even_without_a_live_reply() {
+        // The old Ctrl+C path called `interrupt_command()`, which no-ops when a
+        // decision parks a turn before any reply streams. Route it through the
+        // decision-aware interrupt so Ctrl+C reliably cancels a parked turn.
+        let (mut store, _approval_id) = store_with_visible_approval();
+        assert!(store.state.active_turn().is_none());
+
+        let action = handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+
+        assert!(
+            matches!(sent_command(action), AppUiCommand::InterruptTurn(_)),
+            "Ctrl+C on a parked decision must interrupt, not no-op"
+        );
     }
 
     #[test]
@@ -5144,6 +5797,236 @@ mod tests {
         );
     }
 
+    // ----- `!` bang command — event-loop-level regression pins (user report:
+    // ----- "`!` stopped working"). The store-level dispatch is covered in
+    // ----- `store::tests`; these drive the REAL key pipeline (`handle_key`)
+    // ----- so no modal / focus / steer / vim gate can silently swallow the
+    // ----- draft between the keypress and `compose_command`.
+
+    /// Type `!echo hi` key-by-key and submit with Enter on an idle session:
+    /// the event loop must come back with the `LocalShellExec` send. The `!`
+    /// is delivered as Shift+Char (how Shift+1 layouts report it) to pin that
+    /// the SHIFT modifier routes through the plain-key path, not a modified-
+    /// key edit.
+    #[test]
+    fn bang_draft_enter_dispatches_local_shell_exec_when_idle() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+
+        handle_key(
+            &mut store,
+            KeyEvent::new(KeyCode::Char('!'), KeyModifiers::SHIFT),
+        );
+        assert!(
+            store.shell_escape_mode_active(),
+            "`!` on an empty composer enters shell-escape mode"
+        );
+        for ch in "echo hi".chars() {
+            handle_key(&mut store, key(KeyCode::Char(ch)));
+        }
+
+        let action = handle_key(&mut store, key(KeyCode::Enter));
+
+        let command = sent_command(action);
+        let AppUiCommand::LocalShellExec { cmd, .. } = command else {
+            panic!("expected LocalShellExec, got {command:?}");
+        };
+        assert_eq!(cmd, "echo hi");
+        assert!(store.state.composer.is_empty(), "draft cleared on dispatch");
+    }
+
+    /// Enter with a `!` draft DURING a live steer-capable turn must still
+    /// dispatch the local exec — never a `TurnSteer`, never a staged message
+    /// (#406 interaction; the steer chokepoint sits after the bang intercept).
+    #[test]
+    fn bang_draft_enter_mid_turn_executes_locally_never_steers_or_stages() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_TURN_STEER,
+        ]));
+        store.state.sessions[0].live_reply = Some(LiveReply {
+            turn_id: TurnId::new(),
+            text: "streaming".into(),
+        });
+        assert!(
+            store.state.active_turn().is_some(),
+            "precondition: the turn is live, so a plain prompt WOULD steer"
+        );
+        store.state.set_composer_text("!git status");
+
+        let action = handle_key(&mut store, key(KeyCode::Enter));
+
+        let command = sent_command(action);
+        let AppUiCommand::LocalShellExec { cmd, .. } = command else {
+            panic!("expected LocalShellExec, got {command:?}");
+        };
+        assert_eq!(cmd, "git status");
+        assert!(
+            store.state.pending_turn_steers.is_empty(),
+            "bang must not be steered into the live turn"
+        );
+        assert!(
+            store.state.pending_messages.is_empty(),
+            "bang must not be staged behind the live turn"
+        );
+    }
+
+    /// `dispatch_bang_command` parks focus on the Tasks dock so the running
+    /// chip is visible. The NEXT `!` must still reach the composer (the
+    /// catch-all char arm refocuses it) — a bang after a bang keeps working.
+    #[test]
+    fn bang_after_bang_refocuses_composer_and_executes_again() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        store.state.set_composer_text("!pwd");
+        let first = sent_command(handle_key(&mut store, key(KeyCode::Enter)));
+        assert!(matches!(first, AppUiCommand::LocalShellExec { .. }));
+        assert_eq!(
+            store.state.focus,
+            FocusPane::Tasks,
+            "precondition: the first bang parked focus on the Tasks dock"
+        );
+
+        handle_key(&mut store, key(KeyCode::Char('!')));
+        assert_eq!(store.state.focus, FocusPane::Composer);
+        assert!(store.shell_escape_mode_active());
+        for ch in "pwd".chars() {
+            handle_key(&mut store, key(KeyCode::Char(ch)));
+        }
+        let action = handle_key(&mut store, key(KeyCode::Enter));
+        let command = sent_command(action);
+        let AppUiCommand::LocalShellExec { cmd, .. } = command else {
+            panic!("expected LocalShellExec, got {command:?}");
+        };
+        assert_eq!(cmd, "pwd");
+    }
+
+    // ----- `!` bang × Vim mode -----
+
+    /// Vim Insert mode behaves like the plain composer: `!` on an empty
+    /// composer enters shell-escape mode and Enter runs the command locally.
+    #[test]
+    fn vim_insert_mode_bang_flow_executes_end_to_end() {
+        let mut store = store_with_sessions(1);
+        store.state.vim_mode = true;
+        store.state.composer_mode = crate::model::ComposerMode::Insert;
+        store.state.focus = FocusPane::Composer;
+
+        handle_key(&mut store, key(KeyCode::Char('!')));
+        assert!(store.shell_escape_mode_active());
+        for ch in "ls".chars() {
+            handle_key(&mut store, key(KeyCode::Char(ch)));
+        }
+
+        let action = handle_key(&mut store, key(KeyCode::Enter));
+
+        let command = sent_command(action);
+        let AppUiCommand::LocalShellExec { cmd, .. } = command else {
+            panic!("expected LocalShellExec, got {command:?}");
+        };
+        assert_eq!(cmd, "ls");
+    }
+
+    /// THE regression (vim users): Normal mode swallowed EVERY unmapped char,
+    /// so after any reflexive Esc the `!` shell-escape trigger was silently
+    /// dead — "`!` stopped working". `!` on an EMPTY composer is the
+    /// shell-escape trigger, not text entry: it must fall through to the
+    /// prefix-trigger arm (insert + cwd hint) and flip to Insert mode so the
+    /// command text can be typed, exactly like the plain-composer flow.
+    #[test]
+    fn vim_normal_mode_bang_on_empty_composer_enters_shell_escape_and_insert() {
+        let mut store = store_with_sessions(1);
+        store.state.vim_mode = true;
+        store.state.composer_mode = crate::model::ComposerMode::Normal;
+        store.state.focus = FocusPane::Composer;
+
+        handle_key(&mut store, key(KeyCode::Char('!')));
+
+        assert_eq!(store.state.composer, "!");
+        assert!(store.shell_escape_mode_active());
+        assert_eq!(
+            store.state.composer_mode,
+            crate::model::ComposerMode::Insert,
+            "shell-escape entry must flip to Insert so the command can be typed"
+        );
+
+        // And the whole flow works: type the command, Enter dispatches it.
+        for ch in "ls".chars() {
+            handle_key(&mut store, key(KeyCode::Char(ch)));
+        }
+        let action = handle_key(&mut store, key(KeyCode::Enter));
+        let command = sent_command(action);
+        let AppUiCommand::LocalShellExec { cmd, .. } = command else {
+            panic!("expected LocalShellExec, got {command:?}");
+        };
+        assert_eq!(cmd, "ls");
+    }
+
+    /// Vim semantics preserved: `!` is only the shell-escape trigger on an
+    /// EMPTY composer. With draft text present, Normal mode still swallows it
+    /// (text entry requires Insert) and stays in Normal.
+    #[test]
+    fn vim_normal_mode_bang_mid_draft_stays_swallowed() {
+        let mut store = store_with_sessions(1);
+        store.state.vim_mode = true;
+        store.state.composer_mode = crate::model::ComposerMode::Normal;
+        store.state.focus = FocusPane::Composer;
+        store.state.set_composer_text("draft");
+
+        let action = handle_key(&mut store, key(KeyCode::Char('!')));
+
+        assert!(matches!(action, KeyAction::Continue));
+        assert_eq!(store.state.composer, "draft", "no stray `!` inserted");
+        assert_eq!(
+            store.state.composer_mode,
+            crate::model::ComposerMode::Normal
+        );
+        assert!(!store.shell_escape_mode_active());
+    }
+
+    /// A pending operator (`d` / `g` / `c`) owns the next key: `d!` resolves
+    /// (and discards) the unknown sequence instead of entering shell-escape
+    /// mode, even on an empty composer.
+    #[test]
+    fn vim_normal_pending_operator_consumes_bang_without_entering_shell_escape() {
+        let mut store = store_with_sessions(1);
+        store.state.vim_mode = true;
+        store.state.composer_mode = crate::model::ComposerMode::Normal;
+        store.state.focus = FocusPane::Composer;
+        store.state.composer_vim_pending = Some('d');
+
+        let action = handle_key(&mut store, key(KeyCode::Char('!')));
+
+        assert!(matches!(action, KeyAction::Continue));
+        assert!(store.state.composer.is_empty());
+        assert!(!store.shell_escape_mode_active());
+        assert_eq!(store.state.composer_vim_pending, None, "sequence resolved");
+        assert_eq!(
+            store.state.composer_mode,
+            crate::model::ComposerMode::Normal
+        );
+    }
+
+    /// Enter in vim Normal mode still submits: an existing `!` draft (typed in
+    /// Insert, then Esc'd to Normal) dispatches the local exec.
+    #[test]
+    fn vim_normal_mode_enter_submits_bang_draft() {
+        let mut store = store_with_sessions(1);
+        store.state.vim_mode = true;
+        store.state.composer_mode = crate::model::ComposerMode::Normal;
+        store.state.focus = FocusPane::Composer;
+        store.state.set_composer_text("!pwd");
+
+        let action = handle_key(&mut store, key(KeyCode::Enter));
+
+        let command = sent_command(action);
+        let AppUiCommand::LocalShellExec { cmd, .. } = command else {
+            panic!("expected LocalShellExec, got {command:?}");
+        };
+        assert_eq!(cmd, "pwd");
+    }
+
     #[test]
     fn d_requests_diff_preview_when_selected_task_exposes_preview_id() {
         let preview_id = PreviewId::new();
@@ -5225,6 +6108,116 @@ mod tests {
         assert_eq!(store.state.focus, FocusPane::Composer);
     }
 
+    fn diff_result_with_two_hunks(session_id: SessionKey) -> crate::model::DiffPreviewGetResult {
+        crate::model::DiffPreviewGetResult {
+            status: "ready".into(),
+            source: "pending_store".into(),
+            preview: crate::model::DiffPreview {
+                session_id,
+                preview_id: PreviewId::new(),
+                title: Some("Patch".into()),
+                files: vec![crate::model::DiffPreviewFile {
+                    path: "src/lib.rs".into(),
+                    old_path: None,
+                    status: "modified".into(),
+                    hunks: vec![
+                        crate::model::DiffPreviewHunk {
+                            header: "@@ -1 +1 @@".into(),
+                            lines: vec![crate::model::DiffPreviewLine {
+                                kind: "removed".into(),
+                                content: "old".into(),
+                                old_line: Some(1),
+                                new_line: None,
+                            }],
+                        },
+                        crate::model::DiffPreviewHunk {
+                            header: "@@ -9 +9 @@".into(),
+                            lines: vec![crate::model::DiffPreviewLine {
+                                kind: "added".into(),
+                                content: "new".into(),
+                                old_line: None,
+                                new_line: Some(9),
+                            }],
+                        },
+                    ],
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn v_toggles_diff_view_round_trip_preserving_scroll_position() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Transcript;
+        let session_id = store.state.sessions[0].id.clone();
+        store
+            .state
+            .diff_preview
+            .apply_result(diff_result_with_two_hunks(session_id));
+        store.state.diff_preview.scroll = 7;
+        store.state.diff_preview.selected_hunk = 1;
+
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Char('v'))),
+            KeyAction::Continue
+        ));
+        assert!(store.state.diff_preview.side_by_side);
+        assert_eq!(
+            store.state.diff_preview.scroll, 7,
+            "toggle must preserve scroll position"
+        );
+        assert_eq!(
+            store.state.diff_preview.selected_hunk, 1,
+            "toggle must preserve hunk selection"
+        );
+
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Char('v'))),
+            KeyAction::Continue
+        ));
+        assert!(
+            !store.state.diff_preview.side_by_side,
+            "second press round-trips back to unified"
+        );
+        assert_eq!(store.state.diff_preview.scroll, 7);
+        assert_eq!(store.state.diff_preview.selected_hunk, 1);
+    }
+
+    #[test]
+    fn v_toggle_disabled_when_terminal_too_narrow() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Transcript;
+        let session_id = store.state.sessions[0].id.clone();
+        store
+            .state
+            .diff_preview
+            .apply_result(diff_result_with_two_hunks(session_id));
+        store.state.last_terminal_width = 80;
+
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Char('v'))),
+            KeyAction::Continue
+        ));
+        assert!(
+            !store.state.diff_preview.side_by_side,
+            "toggle is disabled below the side-by-side minimum width"
+        );
+    }
+
+    #[test]
+    fn v_types_into_composer_when_composer_focused() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        store.state.diff_preview.open_loading(PreviewId::new());
+
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Char('v'))),
+            KeyAction::Continue
+        ));
+        assert!(!store.state.diff_preview.side_by_side);
+        assert_eq!(store.state.composer, "v");
+    }
+
     #[test]
     fn inline_diff_preview_does_not_steal_pending_approval_keys() {
         let preview_id = PreviewId::new();
@@ -5272,6 +6265,39 @@ mod tests {
         );
         assert!(store.state.approval_auto_open);
         assert_eq!(store.state.focus, FocusPane::Composer);
+    }
+
+    /// Ctrl aliases for the Alt surface binds (macOS Option is not Alt unless
+    /// the terminal is configured for it): Ctrl+R recovers like Alt+A.
+    #[test]
+    fn hidden_approval_can_be_reopened_with_ctrl_r() {
+        let (mut store, _) = store_with_visible_approval();
+        store.close_modal();
+        assert!(
+            !store
+                .state
+                .approval
+                .as_ref()
+                .expect("approval pending")
+                .visible
+        );
+
+        assert!(matches!(
+            handle_key(
+                &mut store,
+                modified_key(KeyCode::Char('r'), KeyModifiers::CONTROL)
+            ),
+            KeyAction::Continue
+        ));
+
+        assert!(
+            store
+                .state
+                .approval
+                .as_ref()
+                .expect("approval pending")
+                .visible
+        );
     }
 
     #[test]

@@ -75,15 +75,20 @@ app:
     inline_patch: "内联补丁"
     loading: "正在加载差异预览……"
     select_stage_hint: "[/] 选择代码块 | c 暂存所选差异上下文"
+    toggle_side_by_side_hint: "v 并排视图"
+    toggle_unified_hint: "v 统一视图"
+    side_by_side_too_narrow: "并排视图需要至少 %{min} 列"
     more_files_hidden: "还有 %{count} 个文件已隐藏"
     line_unavailable: "此更改无可用的行级差异"
     more_lines_hidden: "还有 %{count} 行差异已隐藏（Ctrl+O 展开）"
+    more_rows_hidden: "还有 %{count} 行并排差异已隐藏（Ctrl+O 展开）"
     more_hunks_hidden: "还有 %{count} 个代码块已隐藏（Ctrl+O 展开）"
   autonomy:
     goal_prefix: "目标："
     loops_running: "循环：%{count} 个活动中"
     loops_paused_suffix: " · %{count} 个已暂停"
     goal_meta: " (%{status} · %{used}/%{budget} Token)"
+    goal_fold_hint: " · Ctrl+P 展开"
     status_active: "进行中"
     status_paused: "已暂停"
     status_budget_limited: "预算已用尽"
@@ -102,6 +107,8 @@ app:
     ps_to_view: "/ps 查看"
     esc_interrupt: "Esc 中断"
     stop_to_close: "/stop 关闭"
+    pending_decision_help: "等待你的确认 — Ctrl+R/Alt+A 应答 · Ctrl+C 中断"
+    parked_decision_banner: "⚠ 已等待你 %{elapsed} — Ctrl+R/Alt+A 应答 · Ctrl+C 中断"
     tool_output_expanded: "工具输出已展开"
   btw:
     answering: "回答中…"
@@ -137,10 +144,12 @@ app:
     large_paste: "大段粘贴已折叠 | Enter 发送全文 | Ctrl+U 清空"
     multiline_tail_lines: "多行输入 | 显示末尾，已隐藏 %{count} 行 | Enter 发送全文 | Ctrl+U 清空"
     multiline_tail_line: "多行输入 | 显示超长行末尾 | Enter 发送全文 | Ctrl+U 清空"
+    peer_readonly: "↳ 只读 peer · 在主智能体处操控 · Ctrl+S 切换 · Ctrl+C 中断"
   hint:
     list_nav: "j/k 或 Up/Down"
     composer_send: "Enter 发送 | Shift+Enter / Ctrl+J 换行 | Tab 智能体"
     statusbar_keys: "Tab 智能体 | Ctrl+O 展开"
+    statusbar_keys_peers: "Tab 智能体 | Ctrl+L peers | Ctrl+S 会话 | Ctrl+O 展开"
     agent_peek_keys: " Tab 下一个 · Shift+Tab 上一个 · ↑/↓ 滚动 · x 取消 · Esc 返回聊天 "
     agent_task_prefix: "任务：%{task}"
     agent_deliverables: "交付物"
@@ -149,7 +158,16 @@ app:
     agent_strip_more: "还有 %{count} 个（Tab 切换）"
     agent_dock_pill: "🐙 %{count} 个智能体 · %{running} 运行中"
     agent_dock_pill_unread: " · %{count}● 未读"
-    agent_dock_toggle_hint: "Alt+G"
+    agent_dock_toggle_hint: "Ctrl+G/Alt+G"
+    # Peer Dock (#407)：会话条溢出时显示的折叠汇总，以及展开的 peer 面板（Alt+P / Ctrl+L）每行标签。
+    peer_dock_pill: "👥 %{count} 个 peer · %{live} 个进行中"
+    peer_dock_pill_blocked: " · %{count}⚠ 等待你"
+    peer_dock_pill_unread: " · %{count}● 未读"
+    peer_dock_toggle_hint: "Alt+P/Ctrl+L 预览"
+    peer_dock_title: " peers "
+    peer_dock_row_blocked: "等你确认：%{reason}"
+    peer_dock_row_idle: "空闲"
+    peer_dock_row_opening: "打开中…"
     agent_no_output: "（暂无输出 —— 该智能体工作时会在此处流式输出结果）"
     menu: "菜单 | j/k 移动 | Enter 确认 | Esc 关闭"
     onboarding: "引导 | Enter 继续 | 输入可编辑字段"
@@ -328,6 +346,8 @@ onboarding:
     saved_status_none: "已保存供应商：无"
     primary: "主供应商"
     fallback: "备用"
+    research_lane: "研究通道"
+    save_research_lane: "保存为研究通道"
   disabled:
     name_empty: "姓名为空"
     username_empty: "用户名为空"
@@ -432,7 +452,7 @@ command:
   profiles:
     desc: 管理本地档案——列出、设为默认、删除或新建。
   goal:
-    desc: 查看、设置、暂停/恢复、停止或清除持久化的会话目标
+    desc: "设置：/goal <目标> [--budget 2m|500k]。管理：pause、resume、stop、clear。单独 /goal 查看当前目标。"
   help:
     desc: 显示可用命令
   keymap:
@@ -447,6 +467,16 @@ command:
     desc: 列出或配置服务器支持的 MCP 条目
   model:
     desc: 选择服务器返回的档案 LLM 模型
+  sessions:
+    desc: 在打开的会话间切换（Ctrl+S/Alt+S）—— 实时回合与未读标记。
+  undo:
+    desc: 将工作区文件回滚到修改前的快照（#1768）。
+  peer:
+    desc: "派生一个带持久任务简报的同伴智能体会话：/peer [--go] [--worktree] [--cwd <path>] [--n <2-8>] <brief>。"
+  gather:
+    desc: "把黑板上的同伴结果汇总进当前会话：/gather [all | <slug> …]。"
+  research:
+    desc: 管理研究模型通道（deep_research 的 cheap/strong 模型）。
   onboard:
     desc: 打开设置向导以配置或重新配置您的档案、供应商、模型和工作区
   permissions:
@@ -490,6 +520,100 @@ lang:
   unknown: 未知语言 '%{value}'。可选：en、zh。
   usage: 当前语言：%{current}。用法：/lang <en|zh>。
 menu:
+  file_picker:
+    title: "插入文件路径"
+    search: "输入以筛选工作区文件"
+    footer: "Enter 在光标处插入相对路径 | Esc 关闭且不插入"
+    item:
+      empty:
+        label: "此工作区中未找到文件"
+        desc: "在工作区根目录下未扫描到可列出的文件（已跳过 .git、target 与 node_modules）。"
+      truncated:
+        label: "仅显示前 %{count} 个文件 —— 输入以缩小范围"
+  sessions:
+    title: 会话
+    subtitle: "⌂ 主会话 · ↳ 同伴 · ✻ 回合进行中 · (n) 自上次查看后完成的回合数。"
+    footer: Enter 切换 | Esc 关闭
+    item:
+      blocked_reason: "⚠ 等待你的确认：%{reason}"
+      current: 当前聚焦的会话。
+      switch_desc: 切换到此会话。
+      empty: 没有打开的会话
+      empty_desc: 请先打开一个会话。
+  undo:
+    title: 工作区快照
+    subtitle: "在代理修改文件前自动记录的还原点。选择一个将工作区回滚。"
+    footer: Enter 恢复快照（会先确认） | Esc 关闭
+    age:
+      just_now: 刚刚
+    item:
+      refresh:
+        label: 刷新快照
+        desc: 对当前会话调用 snapshot/list。
+      stale:
+        label: 尚未加载此会话的快照
+        desc: 选择"刷新"以加载当前会话的快照。
+      unavailable:
+        label: 快照不可用
+        desc: 此会话没有工作区，或未安装 git。
+      disabled:
+        label: "快照采集已关闭（snapshots.enabled）"
+        desc: 下方已有快照仍可恢复；新的修改不会被记录。
+      empty:
+        label: 暂无快照
+        desc: "代理修改文件前会自动记录快照（需开启 snapshots.enabled）。"
+      snap:
+        desc: 选择以恢复 —— 会先确认。
+  undo_confirm:
+    title: "恢复快照"
+    subtitle: "将工作区文件回滚。恢复前会先自动记录当前状态，因此本操作也可撤销。"
+    confirm_title: "恢复 %{snapshot}？"
+    "yes": "是，恢复 %{snapshot}"
+    yes_desc: "使用 snapshot/restore；会话有正在运行的回合时会被拒绝。"
+    "no": "否，保留当前文件"
+    item:
+      empty:
+        label: "没有待恢复的快照"
+  research:
+    title: 研究模型通道
+    subtitle: "deep_research 流水线的命名模型通道（cheap/strong）。需重启生效。"
+    footer: Enter 移除通道（会先确认） | Esc 关闭
+    item:
+      refresh:
+        label: 刷新通道
+        desc: 使用 profile/sub_providers/list。
+      empty:
+        label: 尚未配置研究通道
+        desc: "使用 /research add <key> <provider> <model> 添加。"
+      stale:
+        label: 尚未加载此配置的通道
+        desc: 选择"刷新"以加载此配置的研究通道。
+      lane:
+        desc: 选择以移除此通道 —— 会先确认。
+      add:
+        label: 添加通道…
+        desc: "打开模型选择器，然后选择 fast 或 strong 通道。"
+  research_remove:
+    title: "移除研究通道"
+    item:
+      empty:
+        label: "没有待移除的通道"
+    confirm:
+      title: "移除通道 %{lane}？"
+      subtitle: "从档案的 sub_providers 中删除该通道。需重启生效。"
+      yes: "是，移除 %{lane}"
+      yes_desc: "使用 profile/sub_providers/remove；完成后通道列表会刷新。"
+      no: "否，保留"
+  research_lane_key:
+    title: "保存为哪个研究通道…"
+    subtitle: "深度研究按通道键路由 —— %{provider} 将成为你选择的通道。需重启生效。"
+    occupied: "当前为 %{current}（保存将替换它）"
+    vacant: "尚未配置"
+    item:
+      cheap:
+        desc: "快速/廉价通道 —— deep_research 用于扫描与摘要阶段。"
+      strong:
+        desc: "强推理通道 —— deep_research 用于深度推理与综合阶段。"
   agents:
     item:
       dock_collapse:
@@ -497,7 +621,7 @@ menu:
       dock_expand:
         label: 展开为逐个智能体行
       dock_toggle:
-        desc: 等同于 Alt+G。
+        desc: 等同于 Ctrl+G/Alt+G。
       main:
         desc: 在主窗格显示会话记录。
         label: 主会话
@@ -895,6 +1019,8 @@ menu:
       save_provider:
         desc: 使用 profile/llm/upsert 持久化到与仪表盘相同的档案 JSON。
         label: 保存供应商到档案
+      save_research_lane:
+        desc: "将已配置的供应商保存为深度研究通道（profile/sub_providers/upsert）—— 下一步选择通道：cheap 或 strong。"
       saved_provider:
         desc: 上次成功保存的主要或备用供应商
       selected_provider:
@@ -1105,6 +1231,28 @@ menu:
     unavailable_title: 工具设置不可用
   unavailable: 菜单不可用
 status:
+  undo_no_session: "没有可撤销的活动会话。"
+  peer_usage: "用法：/peer [--go] [--worktree] [--cwd <path>] [--n <2-8>] <brief>"
+  peer_preparing: "正在准备同伴会话…"
+  session_blocked_hint: "%{session} 正在等待你的确认：%{reason} —— 按 Ctrl+S/Alt+S 处理。"
+  peer_prepare_in_flight: "已有同伴会话正在准备中 —— 请等它打开（或约 30 秒后）再发起新的。"
+  peer_opening: "正在打开同伴 %{slug}…"
+  peer_started: "同伴 %{slug} 已在后台开始工作 —— 请留意会话栏中它的标记（Ctrl+S/Alt+S）。"
+  peer_switched: "同伴 %{slug} 已启动 —— 您现在位于它的会话中。"
+  peer_fleet_opening: "正在打开 %{n} 个同伴组成的编队（第一个：%{slug}）…"
+  peer_staged_by_agent: "智能体派生了同伴 %{slug} —— 正在后台工作（Ctrl+S/Alt+S）。"
+  peer_staged_known: "同伴 %{slug} 已经暂存 —— 重复通知已忽略。"
+  gather_requesting: "正在从黑板收集同伴结果…"
+  gather_no_peers: "黑板上还没有同伴 —— 先用 /peer 派生几个吧。"
+  gather_submitted: "已把 %{n} 个同伴的结果从黑板汇总进当前会话。"
+  peer_clear_none: "没有已完成的同伴可清理 —— 运行中和等待中的同伴会保留。"
+  peer_clear_removed: "已从面板清理 %{n} 个已完成的同伴。"
+  research_usage: "用法：/research | /research add <key> <provider> <model> [base_url] [api_key_env] | /research rm <key>"
+  research_add_usage: "用法：/research add <key> <provider> <model> [base_url] [api_key_env]"
+  research_rm_usage: "用法：/research rm <key>"
+  research_profile_unresolved: "当前档案尚未就绪 —— 请在会话准备好后重试。"
+  research_lane_saved: "研究通道 %{key} 已保存：%{label} —— 需重启生效。"
+  sub_provider_restart_required: "%{message} —— 需重启生效。"
   opening_diff_preview: "正在打开差异预览：%{operation} %{path}"
   opening_inline_diff_preview: "正在打开内联差异预览：%{title}"
   approval_requested: "请求审批：%{title}"
@@ -1128,6 +1276,7 @@ status:
   list_more: "，+%{count} 项更多"
   no_session_send_prompt: "没有打开的编码会话。发送提示前请运行 /onboard open-session。"
   message_staged: "消息已暂存；将在当前回合结束后提交。按 Esc 可中断/发送。"
+  steered_into_turn: "已插入正在运行的回合。"
   btw_usage: "用法:/btw <问题> — 在当前回合继续运行时快速旁路提问"
   btw_answering: "btw:回答中…"
   btw_answered: "btw:已回答"
@@ -1366,6 +1515,9 @@ status:
   selected_diff_hunk: "已选择差异代码块：%{path} %{header}"
   no_diff_hunk: "没有可选择的差异代码块"
   no_diff_hunk_context: "没有可暂存的所选差异代码块上下文"
+  diff_view_side_by_side: "并排差异视图"
+  diff_view_unified: "统一差异视图"
+  diff_view_too_narrow: "终端宽度不足，无法并排显示差异（需要至少 %{min} 列）"
   staged_diff_context: "已为下一回合暂存所选差异代码块上下文：%{path}"
   added_diff_context: "已将所选差异代码块上下文添加到输入框：%{path}"
   accepted: "已接受"
@@ -1442,6 +1594,11 @@ status:
   bang_failed: "失败"
   bang_usage: "用法：!<命令>"
   bang_no_output: "（无输出）"
+  bang_mode_hint: "本地 shell —— Enter 在本机 %{cwd} 中运行 · Esc 取消"
+  bang_mode_cancelled: "已取消本地 shell"
+  bang_cwd: "工作目录：%{cwd}"
+  inserted_at_cursor: "已插入 %{text}"
+  file_picker_closed: "文件选择器已关闭（未插入内容）"
   cannot_start_review_active_turn: "轮次进行中，无法启动审查。"
   server_clamped_onboarding_choice: "服务器收紧或拒绝了暂存的引导设置选择。"
   goal_clear_requested: "已请求清除目标"
@@ -1472,6 +1629,8 @@ status:
   # 用户主动中断（Esc/Ctrl+C）自己的轮次时的状态行与简短转录提示。刻意从简：
   # 用户主动停止不是失败，因此不显示真正错误才有的详细“会话摘要”卡片。
   turn_interrupted: "轮次已中断"
+  # 见 en.yml：中断没有生效、轮次在服务端正常跑完时，附加到已提交回答后面的提示。
+  turn_interrupted_truncated: "⚠ 已中断 —— 此处之后的输出被丢弃，本回答不完整。该轮次在服务端已跑完，可重新提问查看剩余内容。"
 saveconfig:
   saved: "设置已保存到 %{path}。"
   failed: "保存配置失败：%{error}"

@@ -81,6 +81,42 @@ https://github.com/octos-org/octos-tui/releases/latest/download/octos-tui-instal
         }
     }
 
+    /// The command to move THIS install onto the **prerelease channel** (rc/beta
+    /// builds), for methods that have a dedicated prerelease channel separate
+    /// from stable. Returns `None` when the method has no such channel, in which
+    /// case the caller advertises a cross-method fallback (npm `@next` / the
+    /// shell installer).
+    ///
+    /// Two-channel scheme (mirrors `dist-workspace.toml` / the release
+    /// workflows): stable never moves when you opt into prereleases.
+    /// - **npm**: prereleases are published under the `next` dist-tag, so
+    ///   `@octos-org/octos-tui@next` is the latest rc while a bare install and
+    ///   `@latest` stay stable.
+    /// - **Homebrew**: prereleases are tracked by a SEPARATE `octos-tui-dev`
+    ///   formula in this repo's tap; the stable `octos-tui` formula is untouched.
+    ///   (`brew install` upgrades in place if the formula has moved.)
+    /// - **cargo-dist installer**: `None` — it self-updates in place via
+    ///   `octos-tui update --prerelease` (axoupdater `LatestMaybePrerelease`).
+    /// - **cargo install / unknown**: `None` — no rc-specific channel; the
+    ///   caller points at the universal npm `@next` channel or the installer.
+    pub fn prerelease_upgrade_command(&self) -> Option<String> {
+        match self {
+            // npm: opt into the `next` dist-tag (never `latest`).
+            InstallMethod::Npm => Some("npm install -g @octos-org/octos-tui@next".to_string()),
+            // Homebrew: the separate dev formula in the in-repo tap
+            // (`octos-org/octos-tui`), never the stable `octos-tui` formula.
+            InstallMethod::Homebrew => {
+                Some("brew install octos-org/octos-tui/octos-tui-dev".to_string())
+            }
+            // Self-updates in place; there is no package-manager command.
+            InstallMethod::CargoDistInstaller => None,
+            // crates.io has no prerelease of octos-tui, `--git` already tracks
+            // bleeding-edge main, and nothing owns an Unknown binary — all fall
+            // through to the caller's npm `@next` / installer fallback.
+            InstallMethod::CargoRegistry | InstallMethod::CargoGit | InstallMethod::Unknown => None,
+        }
+    }
+
     /// Whether `update` can mutate the binary in place (only the cargo-dist
     /// installer; everything else defers to the package manager).
     pub fn is_self_updating(&self) -> bool {
@@ -484,6 +520,83 @@ mod tests {
                 .upgrade_command()
                 .unwrap()
                 .contains("octos-tui-installer.sh")
+        );
+    }
+
+    #[test]
+    fn prerelease_upgrade_commands_are_method_specific() {
+        // npm → the `next` dist-tag (never `latest`).
+        assert_eq!(
+            InstallMethod::Npm.prerelease_upgrade_command().as_deref(),
+            Some("npm install -g @octos-org/octos-tui@next")
+        );
+        // Homebrew → the separate dev formula (never the stable formula).
+        assert_eq!(
+            InstallMethod::Homebrew
+                .prerelease_upgrade_command()
+                .as_deref(),
+            Some("brew install octos-org/octos-tui/octos-tui-dev")
+        );
+        // cargo-dist self-updates in place; the rest have no rc-specific channel.
+        assert!(
+            InstallMethod::CargoDistInstaller
+                .prerelease_upgrade_command()
+                .is_none()
+        );
+        assert!(
+            InstallMethod::CargoRegistry
+                .prerelease_upgrade_command()
+                .is_none()
+        );
+        assert!(
+            InstallMethod::CargoGit
+                .prerelease_upgrade_command()
+                .is_none()
+        );
+        assert!(
+            InstallMethod::Unknown
+                .prerelease_upgrade_command()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn npm_prerelease_uses_next_tag_not_stable_latest() {
+        // The prerelease channel must pin `@next` and must NOT be the stable
+        // `npm update -g @octos-org/octos-tui` (which follows `latest`).
+        let pre = InstallMethod::Npm.prerelease_upgrade_command().unwrap();
+        assert!(
+            pre.contains("@next"),
+            "npm prerelease must target @next: {pre}"
+        );
+        assert_ne!(pre, InstallMethod::Npm.upgrade_command().unwrap());
+    }
+
+    #[test]
+    fn brew_prerelease_targets_dev_formula_not_stable() {
+        // The prerelease channel installs `octos-tui-dev`, never the stable
+        // `octos-tui` formula that a plain `brew upgrade` follows.
+        let pre = InstallMethod::Homebrew
+            .prerelease_upgrade_command()
+            .unwrap();
+        assert!(pre.starts_with("brew install"));
+        assert!(
+            pre.ends_with("octos-tui-dev"),
+            "must target the dev formula: {pre}"
+        );
+        assert_ne!(pre, InstallMethod::Homebrew.upgrade_command().unwrap());
+    }
+
+    #[test]
+    fn stable_upgrade_commands_unchanged_by_prerelease_addition() {
+        // Guard: adding the prerelease channel must not perturb the stable ones.
+        assert_eq!(
+            InstallMethod::Npm.upgrade_command(),
+            Some("npm update -g @octos-org/octos-tui")
+        );
+        assert_eq!(
+            InstallMethod::Homebrew.upgrade_command(),
+            Some("brew update && brew upgrade octos-org/octos-tui/octos-tui")
         );
     }
 

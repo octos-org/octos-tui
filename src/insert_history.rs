@@ -273,7 +273,11 @@ pub(crate) fn sanitize_line_in_place(line: &mut Line<'_>) {
 
 /// `char::is_control` matches Unicode `Cc` — exactly C0 (U+0000–U+001F), DEL
 /// (U+007F) and C1 (U+0080–U+009F).
-fn sanitize_span_content(content: &str) -> String {
+///
+/// `pub(crate)` because renderers that pad content to an exact column width
+/// (`app::fit_diff_cell`) must apply the SAME expansion before measuring, or
+/// the finalized-scrollback pass here would widen their rows after the fact.
+pub(crate) fn sanitize_span_content(content: &str) -> String {
     let mut out = String::with_capacity(content.len());
     for ch in content.chars() {
         if ch == '\t' {
@@ -873,19 +877,18 @@ mod tests {
                 }
                 let symbol = cell.symbol();
                 let row = &mut self.rows[usize::from(y)];
-                let mut col = usize::from(x);
+                let col = usize::from(x);
                 if symbol.is_empty() {
                     if let Some(target) = row.get_mut(col) {
                         *target = ' ';
                     }
                     continue;
                 }
-                for ch in symbol.chars() {
+                for (col, ch) in (col..).zip(symbol.chars()) {
                     if col >= row.len() {
                         break;
                     }
                     row[col] = ch;
-                    col += 1;
                 }
             }
             Ok(())
