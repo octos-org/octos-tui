@@ -2420,8 +2420,20 @@ fn is_active_group(app: &AppState, group_turn: Option<&octos_core::ui_protocol::
 
 fn flow_activity_items(app: &AppState) -> Vec<&ActivityItem> {
     let active_turn_id = app.active_turn().map(|(_, turn_id)| turn_id);
+    let active_session_id = app.active_session().map(|session| &session.id);
     app.activity
         .iter()
+        // An item STAMPED with a session belongs to that session's transcript
+        // and nowhere else. Without this, a background session's turn-less
+        // chips (agent/updated, for one) rendered in whichever session happened
+        // to be focused — the cross-session bleed #247 closed elsewhere. Items
+        // with no session are local/global and still render everywhere, which
+        // is what the majority of `push_activity` callers rely on.
+        .filter(|item| match (item.session_id.as_ref(), active_session_id) {
+            (Some(item_session), Some(active)) => item_session == active,
+            (Some(_), None) => false,
+            (None, _) => true,
+        })
         .filter(|item| match active_turn_id {
             Some(turn_id) => item.turn_id.as_ref() == Some(turn_id),
             // When no turn is active, turn-less running sub-agent progress is
