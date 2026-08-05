@@ -890,7 +890,26 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         && !modal_owns_keyboard(store)
         && store.state.file_picker.is_none()
     {
-        store.state.peer_dock_collapsed = !store.state.peer_dock_collapsed;
+        // Three-stop CYCLE, not a two-state toggle: capped rows → full roster →
+        // collapsed pill → capped rows. The middle stop is what makes a fleet
+        // larger than `PEER_STRIP_MAX_PEER_ROWS` reachable while the MASTER is
+        // focused — `peer_strip_window` only scrolls the capped view when a
+        // PEER is focused, which does nothing for an operator watching from the
+        // master.
+        match (
+            store.state.peer_dock_collapsed,
+            store.state.peer_dock_expanded,
+        ) {
+            (false, false) => store.state.peer_dock_expanded = true,
+            (false, true) => {
+                store.state.peer_dock_collapsed = true;
+                store.state.peer_dock_expanded = false;
+            }
+            (true, _) => {
+                store.state.peer_dock_collapsed = false;
+                store.state.peer_dock_expanded = false;
+            }
+        }
         return KeyAction::Continue;
     }
 
@@ -2855,20 +2874,44 @@ mod tests {
         store
     }
 
-    /// #407 review P1: the dock toggle must fire on its ACTUAL bind (Alt+P and
+    /// #407 review P1: the dock control must fire on its ACTUAL bind (Alt+P and
     /// the Ctrl+L alias) — NOT Ctrl+J, which the composer eats as a newline.
+    ///
+    /// Alt+P / Ctrl+L CYCLES three dock states rather than toggling two, so a
+    /// fleet larger than `PEER_STRIP_MAX_PEER_ROWS` is reachable without
+    /// switching sessions: capped rows → every peer → collapsed pill → back.
+    /// The capped state is the resting default, so the first press from rest
+    /// goes to the full roster.
     #[test]
-    fn peer_dock_toggle_flips_on_alt_p_and_ctrl_l() {
+    fn peer_dock_cycles_capped_then_full_then_pill() {
         for chord in [
             modified_key(KeyCode::Char('p'), KeyModifiers::ALT),
             modified_key(KeyCode::Char('l'), KeyModifiers::CONTROL),
         ] {
             let mut store = store_with_one_peer();
-            let before = store.state.peer_dock_collapsed;
-            assert!(matches!(handle_key(&mut store, chord), KeyAction::Continue));
-            assert_ne!(
-                store.state.peer_dock_collapsed, before,
-                "the dock toggle must flip on {chord:?}"
+            // Rest: capped rows.
+            assert!(!store.state.peer_dock_collapsed, "starts expanded");
+            assert!(!store.state.peer_dock_expanded, "starts capped, not full");
+
+            // 1st press → full roster.
+            handle_key(&mut store, chord);
+            assert!(
+                !store.state.peer_dock_collapsed && store.state.peer_dock_expanded,
+                "1st {chord:?} shows every peer"
+            );
+
+            // 2nd press → collapsed pill.
+            handle_key(&mut store, chord);
+            assert!(
+                store.state.peer_dock_collapsed,
+                "2nd {chord:?} collapses to the pill"
+            );
+
+            // 3rd press → back to capped rows.
+            handle_key(&mut store, chord);
+            assert!(
+                !store.state.peer_dock_collapsed && !store.state.peer_dock_expanded,
+                "3rd {chord:?} returns to the capped rows"
             );
         }
     }

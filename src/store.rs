@@ -462,18 +462,18 @@ impl Store {
             return None;
         }
 
-        // A focused peer is a read-only WATCH surface: plain prompts are refused
-        // (the operator steers peers from the master via `peer_send_input`), and
-        // the draft is KEPT (not cleared) so the text isn't lost when the user
-        // switches back to the master to send it. Slash/bang were handled above,
-        // so client-local commands (`/resume`, `!ls`, …) still work on a peer.
-        if self.state.focused_session_is_peer() {
-            self.state.status =
-                "Peer sessions are read-only — steer peers from the master with peer_send_input."
-                    .into();
-            return None;
-        }
-
+        // A focused peer SENDS like any other session. #453 refused plain
+        // prompts here and pointed at `peer_send_input` — a function that exists
+        // nowhere in this crate, so a peer could not be driven from the peer view
+        // OR the master. Once the composer was restored on a focused peer the
+        // refusal also went invisible: it only set `status`, which live-turn
+        // progress immediately overwrites, so Enter read as a dead key.
+        //
+        // Falling through means a peer with a LIVE turn steers it (the normal
+        // path tries `try_steer_live_turn` first, and `turn/steer` is what the
+        // server advertises for exactly this), and an idle peer starts a turn on
+        // its own session — both addressed to the peer's own session_id, since
+        // every send below resolves the ACTIVE session.
         self.state.clear_current_composer_draft();
         // Accepted plain prompt — record before staging/sending. Slash/bang
         // returned above; readonly/empty/no-session were rejected above, so only
@@ -7279,7 +7279,7 @@ impl Store {
                 None
             }
             ClientEvent::SessionHydrate(result) => {
-                let drain = self.apply_session_hydrate_result(result);
+                let drain = self.apply_session_hydrate_result(result, EmptyProjection::Ignore);
                 self.refresh_active_menu_if_open();
                 drain
             }
@@ -8872,7 +8872,7 @@ impl Store {
         // deliberate rollback must NOT auto-submit a stale staged prompt into the
         // just-trimmed session, so the drain command is discarded here (the stale
         // live_reply is still cleared, which is what matters for the repaint).
-        let _ = self.apply_session_hydrate_result(result.thread);
+        let _ = self.apply_session_hydrate_result(result.thread, EmptyProjection::Authoritative);
         // Rebuild the `/rewind` picker rows from the now-trimmed transcript. The
         // snapshot taken when the picker opened still lists the just-dropped
         // turns; if the picker is still open (the caller then calls
@@ -8988,11 +8988,35 @@ impl Store {
     fn apply_session_hydrate_result(
         &mut self,
         result: SessionHydrateResult,
+        empty_projection: EmptyProjection,
     ) -> Option<AppUiCommand> {
         let session_id = result.session_id.clone();
         // Staged-queue drain released when a stale live turn is finalized below.
         let mut drain: Option<AppUiCommand> = None;
-        let projected_messages = hydrated_projection_messages(&result);
+        let mut projected_messages = hydrated_projection_messages(&result);
+        // An EMPTY projection from a hydrate READ is not evidence that the
+        // session has no history — the rows may not be persisted under this key,
+        // or none survived `hydrated_row_is_displayable`. A peer accumulates its
+        // transcript locally from streamed notifications while it runs in the
+        // background, so honouring an empty read erased the whole thing the
+        // instant you switched into it (Ctrl+S → `resume_session_command` →
+        // hydrate). Drop the projection instead and keep what we hold. The
+        // rollback repaint passes `Authoritative` because there the server has
+        // genuinely just trimmed the turns away.
+        if matches!(empty_projection, EmptyProjection::Ignore)
+            && projected_messages.as_ref().is_some_and(Vec::is_empty)
+            && self
+                .state
+                .sessions
+                .iter()
+                .any(|session| session.id == session_id && !session.messages.is_empty())
+        {
+            projected_messages = None;
+        }
+        // Reported in the status line below. Reads the POST-discard projection so
+        // a dropped empty read doesn't announce "0 messages" over a transcript we
+        // deliberately kept.
+        let projection_applied = projected_messages.is_some();
         let message_count = projected_messages.as_ref().map_or(0, Vec::len);
         let thread_count = result.threads.as_ref().map_or(0, Vec::len);
         let turn_count = result.turns.as_ref().map_or(0, Vec::len);
@@ -9184,7 +9208,7 @@ impl Store {
         }
 
         let mut sections = Vec::new();
-        if result.messages.is_some() {
+        if projection_applied {
             sections.push(t!("status.message_count", count = message_count).into_owned());
         }
         if result.threads.is_some() {
@@ -11025,6 +11049,15 @@ impl Store {
             // octos-core is ahead of this crate and added `VoiceExit`; handling
             // it here keeps the match exhaustive so the workspace compiles.)
             UiNotification::VoiceExit(_) => None,
+            // Same octos-core drift as `VoiceExit` above: the path-overridden
+            // crate has since added a typed `PeerClosed` variant. This client
+            // does NOT route peer teardown through here — `handle_notification`
+            // (transport.rs) intercepts `peer/closed` BEFORE the vendored
+            // `UiNotification::from_method_and_params` and decodes it into
+            // `ClientEvent::PeerClosed`, which `apply_peer_closed_event` owns.
+            // So this arm is unreachable from the wire and must stay a no-op:
+            // handling it here would double-apply the teardown.
+            UiNotification::PeerClosed(_) => None,
         }
     }
 
@@ -11549,11 +11582,22 @@ impl Store {
                             session_result: None,
                         })
                     }
-                    TurnTerminalOutcome::Errored | TurnTerminalOutcome::Interrupted => {
+                    // `RateLimited` is octos-core drift (same as `PeerClosed`
+                    // above): a newer terminal outcome this crate predates. It
+                    // is a FAILED terminal like `Errored` — the turn produced no
+                    // answer — so it takes the error finalizer, not the commit
+                    // path. Only its default label differs, so a server that
+                    // sends no error payload doesn't get mislabelled
+                    // "Turn errored." when it was actually throttled.
+                    TurnTerminalOutcome::Errored
+                    | TurnTerminalOutcome::Interrupted
+                    | TurnTerminalOutcome::RateLimited => {
                         let is_interrupted = outcome == TurnTerminalOutcome::Interrupted;
                         let error = error.unwrap_or_else(|| {
                             let (code, message) = if is_interrupted {
                                 ("interrupted", "Turn interrupted.")
+                            } else if outcome == TurnTerminalOutcome::RateLimited {
+                                ("rate_limited", "Turn stopped: rate limited.")
                             } else {
                                 ("turn_errored", "Turn errored.")
                             };
@@ -13787,6 +13831,18 @@ impl HydratedProjection {
             Self::BackgroundChildCompleted(envelope) => envelope.seq,
         }
     }
+}
+
+/// How [`Store::apply_session_hydrate_result`] should read an EMPTY message
+/// projection. A plain `session/hydrate` READ is `Ignore`: empty means "this
+/// read told us nothing", never "this session has no history" — see the comment
+/// at the discard site. The rollback repaint is `Authoritative`: the server
+/// returns the trimmed thread as a `SessionHydrateResult`, so an empty one is a
+/// real instruction to clear the transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmptyProjection {
+    Ignore,
+    Authoritative,
 }
 
 fn hydrated_projection_messages(result: &SessionHydrateResult) -> Option<Vec<Message>> {
@@ -16733,32 +16789,34 @@ mod tests {
         );
     }
 
-    /// Peer operator console (FIX 2): a peer view is read-only — a plain prompt
-    /// is refused and the draft is KEPT (so the operator can switch to the
-    /// master and send it there).
+    /// A focused peer's composer SENDS. #453 made peer views read-only and
+    /// pointed the user at `peer_send_input` — which does not exist anywhere in
+    /// this crate, so there was no way to drive a peer at all. Once the composer
+    /// was restored on a focused peer (74ecbae) the refusal became invisible:
+    /// `compose_command` set a status string and returned, and that string is
+    /// overwritten by live-turn progress, so Enter looked like a dead key.
     #[test]
-    fn compose_on_peer_focused_session_is_read_only() {
-        // Durable peer identity via the insert-only `opened_peer_sessions` set
-        // (populated at the peer-open chokepoint), not the mutable dock roster.
+    fn compose_on_peer_focused_session_sends_instead_of_silently_refusing() {
         let peer = SessionKey("local:main#peer-refactor".into());
         let mut store = store_with_two_sessions("local:a", "local:main#peer-refactor");
-        store.state.opened_peer_sessions.insert(peer);
+        store.state.opened_peer_sessions.insert(peer.clone());
         store.state.selected_session = 1;
-        assert!(
-            store.state.focused_session_is_peer(),
-            "a focused opened-peer session is read-only"
-        );
-        store.state.composer = "hello peer".into();
+        assert!(store.state.focused_session_is_peer(), "precondition: peer");
+        store.state.composer = "keep going on the retry path".into();
 
         let command = store.compose_command();
-        assert!(command.is_none(), "no turn starts on a read-only peer");
-        assert_eq!(
-            store.state.composer, "hello peer",
-            "the draft is KEPT for the operator to send from the master"
+        assert!(
+            command.is_some(),
+            "Enter on a focused peer produces a command instead of a silent no-op"
         );
         assert!(
-            store.state.status.contains("read-only"),
-            "the status explains the peer is read-only: {}",
+            store.state.composer.is_empty(),
+            "an accepted prompt clears the draft; got: {:?}",
+            store.state.composer
+        );
+        assert!(
+            !store.state.status.contains("read-only"),
+            "no read-only refusal on the status line: {}",
             store.state.status
         );
     }
@@ -16769,7 +16827,7 @@ mod tests {
     /// topic-string check that would false-positive on an ordinary session whose
     /// API topic merely starts with `peer-`.
     #[test]
-    fn cleared_peer_stays_read_only_and_topic_lookalike_is_not_a_peer() {
+    fn cleared_peer_keeps_its_identity_and_topic_lookalike_is_not_a_peer() {
         let peer = SessionKey("local:main#peer-refactor".into());
         let mut store = store_with_two_sessions("local:a", "local:main#peer-refactor");
         // Registered as a peer in BOTH maps, as the open chokepoint does.
@@ -16798,11 +16856,8 @@ mod tests {
         );
         assert!(
             store.state.focused_session_is_peer(),
-            "a cleared-but-focused peer is STILL read-only"
+            "a cleared-but-focused peer KEEPS its peer identity"
         );
-        store.state.composer = "hello".into();
-        assert!(store.compose_command().is_none(), "still read-only");
-        assert_eq!(store.state.composer, "hello", "the draft is kept");
 
         // False-positive guard: an ORDINARY session whose API topic merely
         // starts with `peer-` was never OPENED as a peer, so it is NOT one.
@@ -16823,7 +16878,7 @@ mod tests {
         );
         assert!(
             !store.state.focused_session_is_peer(),
-            "a topic-lookalike never opened as a peer is NOT read-only"
+            "a topic-lookalike never opened as a peer is NOT a peer"
         );
     }
 
@@ -17065,6 +17120,76 @@ now analyzing the bus module"
         assert!(
             line.contains("Run shell command?"),
             "blocked reason leads: {line}"
+        );
+    }
+
+    /// A finished message is truncated from the HEAD (`start…`), not the tail.
+    /// Tail-truncating a settled sentence slices it mid-word and hides the part
+    /// that identifies it — the peer dock rendered
+    /// `…bove or continue the turn with a more specific instruction.` where the
+    /// line actually began `Fix the error above or continue …`. A LIVE reply
+    /// keeps the tail: there the newest streamed text is the point.
+    #[test]
+    fn session_activity_line_truncates_finished_text_from_the_head_live_from_the_tail() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let b = SessionKey("local:b".into());
+        let long = "Fix the error above or continue the turn with a more specific instruction.";
+        assert!(long.chars().count() > 60, "fixture must exceed the cap");
+
+        if let Some(session) = store
+            .state
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == b)
+        {
+            session.messages.push(octos_core::Message {
+                role: octos_core::MessageRole::Assistant,
+                content: long.into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                client_message_id: None,
+                thread_id: None,
+                timestamp: chrono::Utc::now(),
+            });
+        }
+        let line = store
+            .state
+            .session_activity_line(&b)
+            .expect("activity line present");
+        assert!(
+            line.starts_with("Fix the error above"),
+            "a finished message keeps its opening words; got: {line}"
+        );
+        assert!(
+            line.ends_with('…'),
+            "head truncation marks the cut at the END; got: {line}"
+        );
+        assert!(
+            !line.starts_with('…'),
+            "a finished message must not be tail-sliced; got: {line}"
+        );
+
+        // A live reply still shows the newest text, so it keeps the tail.
+        if let Some(session) = store
+            .state
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == b)
+        {
+            session.live_reply = Some(octos_core::app_ui::AppUiLiveReply {
+                turn_id: octos_core::ui_protocol::TurnId::new(),
+                text: long.into(),
+            });
+        }
+        let live = store
+            .state
+            .session_activity_line(&b)
+            .expect("live activity line present");
+        assert!(
+            live.starts_with('…') && live.ends_with("instruction."),
+            "a live reply keeps its tail; got: {live}"
         );
     }
 
@@ -19318,6 +19443,96 @@ now analyzing the bus module"
             store.state.status.contains("Rewound 1"),
             "status reports how many turns were dropped: {}",
             store.state.status
+        );
+    }
+
+    /// Build a hydrate result carrying `messages` verbatim for `session_id`.
+    fn hydrate_result_with_messages(
+        session_id: &SessionKey,
+        messages: Vec<HydratedMessage>,
+    ) -> SessionHydrateResult {
+        SessionHydrateResult {
+            replayed_tool_envelopes: None,
+            session_id: session_id.clone(),
+            cursor: octos_core::ui_protocol::UiCursor {
+                stream: session_id.0.clone(),
+                seq: 1,
+            },
+            context: None,
+            context_state: None,
+            messages: Some(messages),
+            threads: None,
+            turns: None,
+            pending_approvals: None,
+            pending_questions: None,
+            replayed_envelopes: None,
+        }
+    }
+
+    /// Switching to a peer via Ctrl+S sends `session/hydrate` for it
+    /// (`resume_session_command`). A peer's transcript is accumulated locally
+    /// from streamed notifications while it runs in the background, and the
+    /// server's projection for that key can come back EMPTY — either the rows
+    /// aren't persisted under it or none survive `hydrated_row_is_displayable`.
+    /// Replacing the transcript with that empty projection wiped the peer's
+    /// whole history the instant you switched in: the switcher row still showed
+    /// its last line (read from `session.messages`), then the peer rendered as
+    /// a fresh `0 msgs` session behind the launch banner. An empty read is not
+    /// evidence that a session has no history.
+    #[test]
+    fn hydrate_with_empty_projection_keeps_the_existing_transcript() {
+        use crate::client_event::ClientEvent;
+
+        let mut store = store_with_two_sessions("local:main", "local:main#peer-alpha");
+        let peer = store.state.sessions[1].id.clone();
+        store.state.sessions[1].messages = vec![
+            Message::user("read readme.md for 10sec"),
+            Message::assistant("Risks / follow-up: Fix the error above."),
+        ];
+
+        store.apply_client_event(ClientEvent::SessionHydrate(hydrate_result_with_messages(
+            &peer,
+            Vec::new(),
+        )));
+
+        let messages = &store.state.sessions[1].messages;
+        assert_eq!(
+            messages.len(),
+            2,
+            "an empty projection must not clobber the peer's local transcript: {messages:?}"
+        );
+        assert_eq!(messages[0].content, "read readme.md for 10sec");
+        assert!(
+            store
+                .state
+                .session_activity_line(&peer)
+                .is_some_and(|line| line.contains("Risks / follow-up")),
+            "the switcher row keeps resolving the peer's last line"
+        );
+    }
+
+    /// The counterweight to the guard above: `apply_session_rollback_result`
+    /// repaints through the SAME hydrate path, and there an empty projection is
+    /// authoritative — the server just trimmed every turn away. Rewinding to
+    /// nothing must still clear the transcript.
+    #[test]
+    fn rollback_trimming_every_turn_still_clears_the_transcript() {
+        use crate::client_event::ClientEvent;
+
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.sessions[0].messages =
+            vec![Message::user("only question"), Message::assistant("ok")];
+
+        store.apply_client_event(ClientEvent::SessionRollback(SessionRollbackResult {
+            dropped_turns: 1,
+            thread: hydrate_result_with_messages(&session_id, Vec::new()),
+        }));
+
+        assert!(
+            store.state.sessions[0].messages.is_empty(),
+            "a rollback that drops every turn empties the transcript: {:?}",
+            store.state.sessions[0].messages
         );
     }
 

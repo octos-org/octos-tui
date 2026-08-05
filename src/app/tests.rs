@@ -4033,11 +4033,14 @@ mod tests {
         assert_eq!(pending_style.bg, Some(palette.diff_context_bg));
     }
 
+    /// A focused peer accepts typed input and SENDS it, so the composer box,
+    /// the echoed draft and the caret all stay. Collapsing the pane to a 1-row
+    /// bar made that invisible — you typed into a surface that wasn't drawn.
+    /// The hint row now says what Enter does rather than claiming the surface
+    /// is read-only, which stopped being true once `compose_command` dropped
+    /// its peer guard.
     #[test]
-    fn render_composer_peer_is_readonly_bar_not_editable_box() {
-        // Option B: a focused peer is a READ-ONLY watch surface — a single dim
-        // status row, not the bordered composer. No placeholder, no caret, and
-        // the reclaimed rows go to the transcript (1 reserved row, not 5).
+    fn render_composer_on_peer_keeps_editable_box_with_steer_hint() {
         let peer = SessionKey("coding:local:tui#peer-alpha".into());
         let mut app = AppState::new(
             vec![
@@ -4064,15 +4067,17 @@ mod tests {
             false,
         );
         app.opened_peer_sessions.insert(peer.clone());
-        // Focus on the composer pane makes the no-caret assertion meaningful:
-        // even here the peer bar must not place a cursor.
         app.focus = crate::model::FocusPane::Composer;
+        // A client-local command the store still honours on a peer — the very
+        // input the collapsed bar gave the user nowhere to see.
+        app.composer = "/resume".into();
+        app.composer_cursor = Some(app.composer.chars().count());
         assert!(app.focused_session_is_peer(), "precondition: peer focused");
 
         assert_eq!(
             composer_height(&app),
-            1,
-            "peer reserves a slim 1-row bar, not the 5-row composer box"
+            5,
+            "a peer keeps the full composer box — slash/bang input still works there"
         );
 
         let palette = Palette::for_theme(ThemeName::Codex);
@@ -4084,22 +4089,84 @@ mod tests {
             .collect::<String>();
 
         assert!(
-            text.contains("read-only peer"),
-            "shows the read-only bar: {text:?}"
+            text.contains("/resume"),
+            "the typed draft is echoed in the composer: {text:?}"
         );
-        assert!(text.contains("steer from the master"));
         assert!(
-            !text.contains("Ask Octos"),
-            "no editable-composer placeholder on a peer"
+            text.contains("Enter steers this peer"),
+            "the hint row states what Enter does on a peer: {text:?}"
         );
-        // render never placed a caret, so the backend cursor stays at its
-        // top-left default — not down in the (absent) composer input.
-        assert_eq!(
+        assert!(
+            !text.contains("read-only"),
+            "a peer that accepts prompts must not claim to be read-only: {text:?}"
+        );
+        assert_ne!(
             (cursor.x, cursor.y),
             (0, 0),
-            "no caret placed for a read-only peer"
+            "a caret is placed in the peer's composer input"
         );
     }
+
+    /// The "Ask Octos to change code…" placeholder stays on a peer. It was
+    /// suppressed while a plain prompt was exactly what `submit_composer`
+    /// refused — a false affordance. Now that a peer sends, hiding the
+    /// invitation would understate what the surface does.
+    #[test]
+    fn render_composer_on_empty_peer_shows_the_prompt_placeholder() {
+        let peer = SessionKey("coding:local:tui#peer-alpha".into());
+        let mut app = AppState::new(
+            vec![
+                SessionView {
+                    id: SessionKey("local:test".into()),
+                    title: "master".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![],
+                    tasks: vec![],
+                    live_reply: None,
+                },
+                SessionView {
+                    id: peer.clone(),
+                    title: "peer-alpha".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![Message::assistant("peer output")],
+                    tasks: vec![],
+                    live_reply: None,
+                },
+            ],
+            1, // focus the peer
+            "ready".into(),
+            None,
+            false,
+        );
+        app.opened_peer_sessions.insert(peer.clone());
+        app.focus = crate::model::FocusPane::Composer;
+        assert!(app.composer.is_empty(), "precondition: empty draft");
+        assert!(app.focused_session_is_peer(), "precondition: peer focused");
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let buffer = rendered_buffer(&app, palette);
+        let text = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(
+            text.contains("Ask Octos"),
+            "a peer accepts plain prompts, so the placeholder is a REAL \
+             affordance and must be shown: {text:?}"
+        );
+        assert!(
+            text.contains("Enter steers this peer"),
+            "the mode is still stated on the hint row: {text:?}"
+        );
+    }
+
+    // `render_composer_peer_is_readonly_bar_not_editable_box` lived here. It
+    // pinned the 1-row collapse (height 1, no caret) that made a focused peer's
+    // still-working slash/bang input invisible; the two tests above replace it,
+    // keeping its assertions that survive — the read-only notice is shown and no
+    // plain-prompt placeholder invites a refused prompt.
 
     #[test]
     fn render_composer_is_tall_and_places_cursor_in_input() {
@@ -10375,7 +10442,7 @@ mod tests {
             .insert(sid.clone(), (Some(1_200), Some(39_800), None));
 
         app.peer_dock_collapsed = false;
-        let lines = peer_strip_lines(&app, Palette::for_theme(app.theme), 4);
+        let lines = peer_strip_lines(&app, Palette::for_theme(app.theme), 4, 118);
         let text: String = lines
             .iter()
             .flat_map(|line| line.spans.iter())
@@ -10412,7 +10479,7 @@ mod tests {
         app.peer_dock_collapsed = false;
 
         let strip_text = |app: &AppState| -> String {
-            peer_strip_lines(app, Palette::for_theme(app.theme), 4)
+            peer_strip_lines(app, Palette::for_theme(app.theme), 4, 118)
                 .iter()
                 .flat_map(|line| line.spans.iter())
                 .map(|s| s.content.as_ref().to_string())
@@ -10548,7 +10615,12 @@ mod tests {
         app.peer_dock_collapsed = false;
 
         // No approval yet → no affordance on the row.
-        let before = lines_text(&peer_strip_lines(&app, Palette::for_theme(app.theme), 4));
+        let before = lines_text(&peer_strip_lines(
+            &app,
+            Palette::for_theme(app.theme),
+            4,
+            118,
+        ));
         assert!(
             !before.contains("Alt+Y approve"),
             "no affordance until an approval is stashed; got: {before}"
@@ -10569,10 +10641,252 @@ mod tests {
             ),
         );
 
-        let after = lines_text(&peer_strip_lines(&app, Palette::for_theme(app.theme), 4));
+        let after = lines_text(&peer_strip_lines(
+            &app,
+            Palette::for_theme(app.theme),
+            4,
+            118,
+        ));
         assert!(
             after.contains("Alt+Y approve · Alt+N deny"),
             "a stashed peer approval renders the approve/deny affordance; got: {after}"
+        );
+    }
+
+    /// The Peer Dock caps at `PEER_STRIP_MAX_PEER_ROWS` rows. With a fleet
+    /// larger than the cap the drawn window must FOLLOW the focused peer, the
+    /// way `agent_strip_window` follows the selected agent — otherwise the dock
+    /// is frozen on peers 1..=4 behind a `+N` marker and focusing peer 6 via
+    /// Ctrl+S leaves no row for the session you are actually looking at.
+    #[test]
+    fn peer_dock_window_scrolls_to_keep_the_focused_peer_visible() {
+        let peers: Vec<SessionKey> = (1..=6)
+            .map(|n| SessionKey(format!("coding:local:tui#peer-p{n}")))
+            .collect();
+
+        let mut sessions = vec![SessionView {
+            id: SessionKey("local:test".into()),
+            title: "master".into(),
+            profile_id: Some("coding".into()),
+            messages: vec![],
+            tasks: vec![],
+            live_reply: None,
+        }];
+        for peer in &peers {
+            sessions.push(SessionView {
+                id: peer.clone(),
+                title: peer.0.clone(),
+                profile_id: Some("coding".into()),
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            });
+        }
+
+        // Focus the LAST peer — the one a fixed `take(rows)` prefix can never
+        // reach.
+        let mut app = AppState::new(sessions, 6, "ready".into(), None, false);
+        app.peer_dock_collapsed = false;
+        for peer in &peers {
+            app.opened_peer_sessions.insert(peer.clone());
+            app.peer_session_meta.insert(
+                peer.clone(),
+                crate::model::PeerMeta {
+                    slug: peer.topic().unwrap().strip_prefix("peer-").unwrap().into(),
+                    brief_path: "/tmp/brief.md".into(),
+                    agent_staged: false,
+                    created: std::time::Instant::now(),
+                    finished_at: None,
+                },
+            );
+        }
+        assert!(
+            app.focused_session_is_peer(),
+            "precondition: peer 6 focused"
+        );
+
+        let text = lines_text(&peer_strip_lines(
+            &app,
+            Palette::for_theme(app.theme),
+            4,
+            118,
+        ));
+        assert!(
+            text.contains("p6"),
+            "the dock window follows the focused peer; got: {text}"
+        );
+        assert!(
+            !text.contains("p1"),
+            "a window reaching p6 has scrolled p1 off the top; got: {text}"
+        );
+
+        // The approve/deny gate must agree with what is drawn, or the dock keys
+        // would act on a row the user cannot see.
+        let visible = visible_peer_dock_keys(&app, 40);
+        assert!(
+            visible.contains(&peers[5]),
+            "focused peer is actionable; got: {visible:?}"
+        );
+        assert!(
+            !visible.contains(&peers[0]),
+            "scrolled-off peer is not actionable; got: {visible:?}"
+        );
+    }
+
+    /// The dock row is sized from the TERMINAL WIDTH, not a fixed 60-char
+    /// activity cap plus a 20-char slug. On a wide terminal the old caps left
+    /// half the row blank while still cutting the peer's task off at
+    /// `…continue the tu…`. Narrow terminals must still truncate.
+    #[test]
+    fn peer_dock_row_fills_the_terminal_width_instead_of_a_fixed_cap() {
+        let peer = SessionKey("coding:local:tui#peer-explore2-rate-limiter".into());
+        let long = "- Risks / follow-up: Fix the error above or continue the turn \
+                    with a more specific instruction about the rate limiter.";
+
+        let mut app = AppState::new(
+            vec![
+                SessionView {
+                    id: SessionKey("local:test".into()),
+                    title: "master".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![],
+                    tasks: vec![],
+                    live_reply: None,
+                },
+                SessionView {
+                    id: peer.clone(),
+                    title: "peer".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![Message::assistant(long)],
+                    tasks: vec![],
+                    live_reply: None,
+                },
+            ],
+            0, // master focused — the dock still has to fill its row
+            "ready".into(),
+            None,
+            false,
+        );
+        app.peer_dock_collapsed = false;
+        app.opened_peer_sessions.insert(peer.clone());
+        app.peer_session_meta.insert(
+            peer.clone(),
+            crate::model::PeerMeta {
+                slug: "explore2-rate-limiter-approaches".into(),
+                brief_path: "/tmp/brief.md".into(),
+                agent_staged: false,
+                created: std::time::Instant::now(),
+                finished_at: None,
+            },
+        );
+
+        // Wide terminal: the row spends the space it has.
+        let wide = lines_text(&peer_strip_lines(
+            &app,
+            Palette::for_theme(app.theme),
+            1,
+            160,
+        ));
+        assert!(
+            wide.contains("with a more specific instruction"),
+            "a 160-col row shows far more than 60 chars of activity; got: {wide}"
+        );
+        assert!(
+            wide.contains("explore2-rate-limiter-approaches"),
+            "a wide row shows the full slug, not 20 chars; got: {wide}"
+        );
+        let widest = wide.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+        assert!(
+            widest <= 160,
+            "no row may exceed the frame width; got {widest}: {wide}"
+        );
+
+        // Narrow terminal: still truncates rather than overflowing.
+        let narrow = lines_text(&peer_strip_lines(
+            &app,
+            Palette::for_theme(app.theme),
+            1,
+            80,
+        ));
+        let narrowest = narrow.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+        assert!(
+            narrowest <= 80,
+            "an 80-col row stays within the frame; got {narrowest}: {narrow}"
+        );
+        assert!(
+            !narrow.contains("with a more specific instruction"),
+            "an 80-col row cannot fit the whole line; got: {narrow}"
+        );
+    }
+
+    /// In the fully-expanded state the dock drops the `PEER_STRIP_MAX_PEER_ROWS`
+    /// cap and draws every peer — bounded only by what the terminal can spare —
+    /// so a 6-peer fleet is readable without switching sessions. The `+N`
+    /// overflow marker disappears because nothing is hidden.
+    #[test]
+    fn peer_dock_expanded_state_draws_every_peer_and_drops_the_overflow_marker() {
+        let mut app = autonomy_app_state();
+        for n in 1..=6 {
+            let sid = SessionKey(format!("coding:local:tui#peer-p{n}"));
+            app.opened_peer_sessions.insert(sid.clone());
+            app.peer_session_meta.insert(
+                sid,
+                crate::model::PeerMeta {
+                    slug: format!("p{n}"),
+                    brief_path: "/tmp/brief.md".into(),
+                    agent_staged: false,
+                    created: std::time::Instant::now(),
+                    finished_at: None,
+                },
+            );
+        }
+        app.peer_dock_collapsed = false;
+
+        // Capped (resting) state: 4 rows + title, and a `+2` marker.
+        app.peer_dock_expanded = false;
+        assert_eq!(
+            peer_strip_height(&app, 40),
+            5,
+            "capped dock reserves title + 4 peer rows"
+        );
+        let capped = lines_text(&peer_strip_lines(
+            &app,
+            Palette::for_theme(app.theme),
+            peer_strip_height(&app, 40) - 1,
+            118,
+        ));
+        assert!(capped.contains("+2"), "capped dock marks the overflow");
+
+        // Expanded: every peer, no marker.
+        app.peer_dock_expanded = true;
+        assert_eq!(
+            peer_strip_height(&app, 40),
+            7,
+            "expanded dock reserves title + all 6 peer rows"
+        );
+        let full = lines_text(&peer_strip_lines(
+            &app,
+            Palette::for_theme(app.theme),
+            peer_strip_height(&app, 40) - 1,
+            118,
+        ));
+        for n in 1..=6 {
+            assert!(
+                full.contains(&format!("p{n}")),
+                "peer p{n} is drawn: {full}"
+            );
+        }
+        // The marker is ` +N `; `Alt+P` in the hint also has a `+`, so match the
+        // marker's leading space.
+        assert!(
+            !full.contains(" +"),
+            "nothing is hidden, so no overflow marker: {full}"
+        );
+
+        // A short terminal still clamps — the dock may never eat the layout.
+        assert!(
+            peer_strip_height(&app, 14) <= 3,
+            "expanded dock still yields to a short terminal"
         );
     }
 
