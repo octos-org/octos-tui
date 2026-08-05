@@ -36776,11 +36776,6 @@ now analyzing the bus module"
         );
     }
 
-    /// PR384 fix F2 (corrected): an applied lane mutation completes the
-    /// wizard's OWN lane save — consumes the pending flag, records the save,
-    /// resets the staged selection (like a fallback save), clears the intent,
-    /// and names the lane key in the completion message.
-    #[test]
     /// A lane saved OUTSIDE the wizard must still say a restart is required.
     ///
     /// The server persists the lane but does NOT rebuild the live runtime — the
@@ -36847,6 +36842,11 @@ now analyzing the bus module"
         );
     }
 
+    /// PR384 fix F2 (corrected): an applied lane mutation completes the
+    /// wizard's OWN lane save — consumes the pending flag, records the save,
+    /// resets the staged selection (like a fallback save), clears the intent,
+    /// and names the lane key in the completion message.
+    #[test]
     fn applied_lane_mutation_completes_the_wizard_lane_save() {
         let mut store = store_with_empty_session();
         store.state.capabilities = Some(lane_capabilities());
