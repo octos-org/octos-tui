@@ -131,6 +131,7 @@ enum Provider {
     Context,
     Resume,
     Agents,
+    Loops,
     Rewind,
     Model,
     ModelConfig,
@@ -177,6 +178,7 @@ impl MenuProvider for Provider {
             Self::Context => MENU_CONTEXT,
             Self::Resume => MENU_RESUME,
             Self::Agents => crate::menu::registry::MENU_AGENTS,
+            Self::Loops => crate::menu::registry::MENU_LOOPS,
             Self::Rewind => MENU_REWIND,
             Self::Model => MENU_MODEL,
             Self::ModelConfig => MENU_MODEL_CONFIG,
@@ -223,6 +225,7 @@ impl MenuProvider for Provider {
             Self::Context => context_menu(ctx),
             Self::Resume => resume_menu(ctx),
             Self::Agents => agents_menu(ctx),
+            Self::Loops => loops_menu(ctx),
             Self::Rewind => rewind_menu(ctx),
             Self::Model => model_menu(ctx),
             Self::ModelConfig => model_config_menu(ctx),
@@ -1169,6 +1172,116 @@ fn agents_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     MenuBuildResult::Ready(MenuSpec {
         id: MenuId::from(crate::menu::registry::MENU_AGENTS),
         title: t!("menu.agents.title").into_owned(),
+        subtitle: Some(subtitle),
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
+        preview: None,
+        mode: MenuMode::SingleSelect,
+    })
+}
+
+/// `/loop` list menu: one row per loop in the active session — status glyph,
+/// loop id, cadence, prompt — each row offers pause/resume/delete/fire-now
+/// via the matching `/loop <verb> <id>` slash command. Purely local: reads the
+/// client-side loop mirror (`set_session_loops`), no AppUI round-trip. The menu
+/// is opened after a `/loop list` response lands so the user actually sees the
+/// list (previously only a status-bar count chip surfaced).
+fn loops_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    fn loop_status_glyph(status: &str) -> &'static str {
+        match status {
+            "active" => "▶",
+            "paused" => "⏸",
+            _ => "•",
+        }
+    }
+
+    fn cadence_label(record: &octos_core::ui_protocol::UiLoopRecord) -> String {
+        match record.interval_seconds {
+            Some(secs) if secs >= 3600 => format!("every {}h", secs / 3600),
+            Some(secs) if secs >= 60 => format!("every {}m", secs / 60),
+            Some(secs) => format!("every {}s", secs),
+            None => record.mode.clone(),
+        }
+    }
+
+    if ctx.app.loops.is_empty() {
+        return MenuBuildResult::Unavailable(MenuStatusSpec {
+            id: MenuId::from(crate::menu::registry::MENU_LOOPS),
+            title: t!("menu.loops.unavailable_title").into_owned(),
+            message: t!("menu.loops.unavailable_empty").into_owned(),
+            footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
+        });
+    }
+
+    let mut items = Vec::new();
+    for record in ctx.app.loops {
+        let cadence = cadence_label(record);
+        let prompt_summary = record
+            .prompt
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("")
+            .chars()
+            .take(60)
+            .collect::<String>();
+        let base_label = format!(
+            "{} {} — {} ({})",
+            loop_status_glyph(&record.status),
+            record.loop_id,
+            record.status,
+            cadence
+        );
+
+        // One action row per applicable verb, dispatched as the matching slash
+        // command so it flows through the existing capability-gated loop
+        // command path.
+        let verbs: &[&str] = match record.status.as_str() {
+            "active" => &["pause", "fire-now", "delete"],
+            "paused" => &["resume", "delete"],
+            _ => &["delete"],
+        };
+        for verb in verbs {
+            items.push(
+                MenuItem::new(
+                    format!("loops.{verb}.{}", record.loop_id),
+                    format!("{base_label}  ·  {verb}"),
+                    MenuAction::Local(LocalAction::RunSlashCommand(format!(
+                        "/loop {verb} {}",
+                        record.loop_id
+                    ))),
+                )
+                .with_description(prompt_summary.clone()),
+            );
+        }
+    }
+
+    let active = ctx
+        .app
+        .loops
+        .iter()
+        .filter(|l| l.status == "active")
+        .count();
+    let paused = ctx
+        .app
+        .loops
+        .iter()
+        .filter(|l| l.status == "paused")
+        .count();
+    let subtitle = t!(
+        "menu.loops.subtitle",
+        count = ctx.app.loops.len().to_string(),
+        active = active.to_string(),
+        paused = paused.to_string(),
+    )
+    .into_owned();
+
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_LOOPS),
+        title: t!("menu.loops.title").into_owned(),
         subtitle: Some(subtitle),
         items,
         tabs: Vec::new(),
@@ -9122,6 +9235,94 @@ mod tests {
             .find(|item| item.id == "cost.estimated")
             .expect("cost item");
         assert_eq!(cost.description.as_deref(), Some("$0.0025"));
+    }
+
+    fn loop_record(loop_id: &str, status: &str) -> octos_core::ui_protocol::UiLoopRecord {
+        octos_core::ui_protocol::UiLoopRecord {
+            loop_id: loop_id.into(),
+            session_id: octos_core::SessionKey("local:test".into()),
+            profile_id: Some("coding".into()),
+            prompt: "check the build every hour".into(),
+            mode: "interval".into(),
+            interval_seconds: Some(3600),
+            status: status.into(),
+            next_run_at_ms: None,
+            last_run_at_ms: None,
+            expires_at_ms: 1,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        }
+    }
+
+    /// `/loop` list menu: a row per loop with pause/resume/delete/fire actions
+    /// dispatched as the matching `/loop <verb> <id>` slash command; Unavailable
+    /// when the session has no loops.
+    #[test]
+    fn loops_menu_lists_loops_with_actions() {
+        let loops = vec![
+            loop_record("build-check", "active"),
+            loop_record("nightly", "paused"),
+        ];
+        let ctx = MenuContext {
+            availability: AvailabilityContext::local(),
+            app: MenuAppSnapshot {
+                loops: &loops,
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let spec = ready_spec(loops_menu(&ctx));
+
+        // Active loop gets pause/fire-now/delete rows; paused gets resume/delete.
+        assert!(spec
+            .items
+            .iter()
+            .any(|item| item.id == "loops.pause.build-check"));
+        assert!(spec
+            .items
+            .iter()
+            .any(|item| item.id == "loops.fire-now.build-check"));
+        assert!(spec
+            .items
+            .iter()
+            .any(|item| item.id == "loops.resume.nightly"));
+        let pause_row = spec
+            .items
+            .iter()
+            .find(|item| item.id == "loops.pause.build-check")
+            .expect("pause row");
+        assert!(
+            matches!(
+                &pause_row.action,
+                MenuAction::Local(LocalAction::RunSlashCommand(cmd)) if cmd == "/loop pause build-check"
+            ),
+            "row dispatches the pause slash command"
+        );
+        assert!(
+            !spec.items.iter().any(|item| item.id == "loops.pause.nightly"),
+            "a paused loop offers resume, not pause"
+        );
+    }
+
+    #[test]
+    fn loops_menu_unavailable_when_empty() {
+        let loops: Vec<octos_core::ui_protocol::UiLoopRecord> = vec![];
+        let ctx = MenuContext {
+            availability: AvailabilityContext::local(),
+            app: MenuAppSnapshot {
+                loops: &loops,
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        assert!(matches!(
+            loops_menu(&ctx),
+            MenuBuildResult::Unavailable(_)
+        ));
     }
 
     fn dock_agent(id: &str, status: &str) -> octos_core::ui_protocol::UiAgentRecord {

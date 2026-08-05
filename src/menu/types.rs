@@ -753,6 +753,9 @@ pub struct MenuAppSnapshot<'a> {
     /// Active-session sub-agent roster for the `/agents` picker (#323),
     /// mirrored from `AppState::active_session_agents`.
     pub agents: &'a [octos_core::ui_protocol::UiAgentRecord],
+    /// Active-session loop roster for the `/loop` list menu, mirrored from
+    /// `AppState`'s per-session autonomy loops.
+    pub loops: &'a [octos_core::ui_protocol::UiLoopRecord],
     /// Agent ids with unread terminal outcomes (Agent Dock badges, #323).
     pub unseen_agent_ids: &'a [String],
     /// The agent currently shown in the main pane, when peeking one —

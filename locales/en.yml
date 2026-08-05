@@ -1100,6 +1100,11 @@ menu:
     title: Sub-agents
     unavailable_empty: No sub-agents in this session yet — they appear here when the model spawns workers.
     unavailable_title: Sub-agent dock
+  loops:
+    subtitle: "%{count} loops · %{active} active · %{paused} paused"
+    title: Loops
+    unavailable_empty: No loops in this session yet — create one with /loop <prompt> or /loop <prompt> every <interval>.
+    unavailable_title: Loops
   availability:
     approval_has_focus: approval modal has keyboard focus
     blocked_read_only: blocked in read-only mode

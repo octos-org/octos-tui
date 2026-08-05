@@ -8368,6 +8368,17 @@ impl AppState {
             .unwrap_or(&[])
     }
 
+    /// Active-session loop roster for the `/loop` list menu — mirrors
+    /// `active_session_agents` but for `UiLoopRecord`s.
+    pub fn active_session_loops(&self) -> &[octos_core::ui_protocol::UiLoopRecord] {
+        let Some(session) = self.active_session() else {
+            return &[];
+        };
+        self.session_autonomy_for(&session.id)
+            .map(|state| state.loops.as_slice())
+            .unwrap_or(&[])
+    }
+
     /// Agent ids with unread terminal outcomes in the active session — the
     /// Agent Dock badge set (#323). Empty when there is no active session.
     pub fn active_session_unseen_agents(&self) -> &[String] {

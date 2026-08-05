@@ -72,6 +72,9 @@ pub const MENU_COST: &str = "cost";
 /// `/resume` session picker menu.
 pub const MENU_RESUME: &str = "resume";
 pub const MENU_AGENTS: &str = "agents";
+/// `/loop` list menu — one row per loop in the active session (status, id,
+/// cadence, prompt) with pause/resume/delete/fire-now actions.
+pub const MENU_LOOPS: &str = "loops";
 /// `/rewind` turn picker menu.
 pub const MENU_REWIND: &str = "rewind";
 pub const MENU_STATUS: &str = "status";

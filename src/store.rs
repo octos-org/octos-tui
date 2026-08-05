@@ -6028,6 +6028,7 @@ impl Store {
             context_window_usage: selected_session
                 .and_then(|session| crate::app::context_window_usage(&self.state, &session.id)),
             agents: self.state.active_session_agents(),
+            loops: self.state.active_session_loops(),
             unseen_agent_ids: self.state.active_session_unseen_agents(),
             chat_view_agent_id: match &self.state.chat_view {
                 crate::model::ChatViewTarget::Agent(id) => Some(id.as_str()),
@@ -7689,6 +7690,15 @@ impl Store {
                 let count = self
                     .state
                     .set_session_loops(&result.session_id, result.loops);
+                // Surface the list the user asked for: previously `/loop list`
+                // only refreshed the mirror + a status-bar count chip, never
+                // rendered the loops. Open the loops menu so each loop's
+                // status/id/cadence/prompt (and its pause/resume/delete/fire
+                // actions) is actually visible. Set the status AFTER opening:
+                // `open_menu` overwrites `state.status` with the menu label,
+                // so the refresh acknowledgment must come last to stay visible
+                // (and to keep the `status contains "N loop"` contract).
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_LOOPS));
                 self.state.status = t!("status.loop_list_refreshed", count = count).into_owned();
             }
             AutonomyResult::LoopMutation { method, result } => {
