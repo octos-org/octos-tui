@@ -9057,18 +9057,30 @@ impl AppState {
     pub fn session_activity_line(&self, session_id: &SessionKey) -> Option<String> {
         const ACTIVITY_CHARS: usize = 60;
         fn last_line_tail(text: &str, cap: usize) -> Option<String> {
+            use unicode_segmentation::UnicodeSegmentation;
+            use unicode_width::UnicodeWidthStr;
             let line = text.lines().rev().find(|line| !line.trim().is_empty())?;
             let line = line.trim();
-            let chars = line.chars().count();
-            Some(if chars > cap {
-                let tail: String = line
-                    .chars()
-                    .skip(chars.saturating_sub(cap.saturating_sub(1)))
-                    .collect();
-                format!("…{tail}")
-            } else {
-                line.to_owned()
-            })
+            // `cap` is a COLUMN budget — the peer dock row and the Alt+S
+            // switcher row both size in columns. Counting `char`s let a CJK
+            // summary render at twice its allowance (119 columns for a cap of
+            // 60) and overflow the row. Walk graphemes from the END, keeping
+            // one column for the leading ellipsis.
+            if line.width() <= cap {
+                return Some(line.to_owned());
+            }
+            let budget = cap.saturating_sub(1);
+            let mut kept = std::collections::VecDeque::new();
+            let mut used = 0usize;
+            for grapheme in line.graphemes(true).rev() {
+                let w = grapheme.width();
+                if used + w > budget {
+                    break;
+                }
+                used += w;
+                kept.push_front(grapheme);
+            }
+            Some(format!("…{}", kept.into_iter().collect::<String>()))
         }
         if let Some(reason) = self.session_blocked_reason(session_id) {
             return Some(t!("menu.sessions.item.blocked_reason", reason = reason).into_owned());

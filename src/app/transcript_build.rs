@@ -551,7 +551,13 @@ pub fn finalized_live_turn_lines_between(
         .starts_with(previous.reply_flushed_text.as_str())
     {
         push_live_reply_delta_seeded(
-            &mut lines, app, session_id, turn_id, palette, wrap_width, previous, next,
+            &mut lines,
+            app,
+            session_id,
+            turn_id,
+            palette,
+            wrap_width,
+            FinalizationSeam { previous, next },
         );
     }
 
@@ -596,6 +602,15 @@ pub fn finalized_live_turn_lines_between(
     lines
 }
 
+/// The two ends of one finalization step. `push_live_reply_delta_seeded`
+/// renders exactly what changed between them, so they are passed as a pair
+/// rather than as two positional arguments that could be swapped.
+#[derive(Clone, Copy)]
+pub(super) struct FinalizationSeam<'a> {
+    pub previous: &'a LiveTurnFinalization,
+    pub next: &'a LiveTurnFinalization,
+}
+
 pub(super) fn push_live_reply_delta_seeded(
     lines: &mut Vec<Line<'static>>,
     app: &AppState,
@@ -603,9 +618,9 @@ pub(super) fn push_live_reply_delta_seeded(
     turn_id: &octos_core::ui_protocol::TurnId,
     palette: Palette,
     wrap_width: usize,
-    previous: &LiveTurnFinalization,
-    next: &LiveTurnFinalization,
+    seam: FinalizationSeam<'_>,
 ) {
+    let FinalizationSeam { previous, next } = seam;
     let previous_len = previous.reply_flushed_text.len();
     let next_len = next.reply_flushed_text.len();
     let boundaries = live_reply_segment_boundaries_in_delta(
@@ -1433,10 +1448,12 @@ pub(super) fn push_message_block(
                 lines,
                 palette,
                 prose,
-                indent,
-                prose_marker,
-                Some(bg),
-                width,
+                BodyLayout {
+                    indent,
+                    prose_marker,
+                    bg: Some(bg),
+                    width,
+                },
             );
         }
         push_session_summary_card(lines, palette, summary, bg, width);
@@ -1447,10 +1464,12 @@ pub(super) fn push_message_block(
         lines,
         palette,
         content,
-        indent,
-        prose_marker,
-        Some(bg),
-        width,
+        BodyLayout {
+            indent,
+            prose_marker,
+            bg: Some(bg),
+            width,
+        },
     );
 }
 
@@ -1566,10 +1585,12 @@ pub(super) fn push_live_reply_block(
         lines,
         palette,
         content,
-        ASSISTANT_BODY_INDENT,
-        marker,
-        Some(bg),
-        width,
+        BodyLayout {
+            indent: ASSISTANT_BODY_INDENT,
+            prose_marker: marker,
+            bg: Some(bg),
+            width,
+        },
     );
 }
 
@@ -1599,10 +1620,12 @@ pub(super) fn push_live_reply_block_seeded(
         lines,
         palette,
         content,
-        ASSISTANT_BODY_INDENT,
-        marker,
-        Some(bg),
-        width,
+        BodyLayout {
+            indent: ASSISTANT_BODY_INDENT,
+            prose_marker: marker,
+            bg: Some(bg),
+            width,
+        },
         previous_reply_has_output,
         previous_reply_ends_blank,
     );
@@ -1795,42 +1818,53 @@ pub(super) fn push_formatted_body(
     bg: Option<Color>,
     width: usize,
 ) {
-    push_formatted_body_marked(lines, palette, content, indent, None, bg, width);
+    push_formatted_body_marked(
+        lines,
+        palette,
+        content,
+        BodyLayout {
+            indent,
+            prose_marker: None,
+            bg,
+            width,
+        },
+    );
+}
+
+/// How a formatted body is indented, marked and coloured. These four always
+/// travel together through the `push_formatted_body_*` chain, so they are
+/// passed as one value rather than four positional arguments.
+#[derive(Clone, Copy)]
+pub(super) struct BodyLayout {
+    pub indent: &'static str,
+    pub prose_marker: Option<&'static str>,
+    pub bg: Option<Color>,
+    pub width: usize,
 }
 
 pub(super) fn push_formatted_body_marked(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
     content: &str,
-    indent: &'static str,
-    prose_marker: Option<&'static str>,
-    bg: Option<Color>,
-    width: usize,
+    layout: BodyLayout,
 ) {
-    push_formatted_body_marked_seeded(
-        lines,
-        palette,
-        content,
-        indent,
-        prose_marker,
-        bg,
-        width,
-        false,
-        false,
-    );
+    push_formatted_body_marked_seeded(lines, palette, content, layout, false, false);
 }
 
 pub(super) fn push_formatted_body_marked_seeded(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
     content: &str,
-    indent: &'static str,
-    prose_marker: Option<&'static str>,
-    bg: Option<Color>,
-    width: usize,
+    layout: BodyLayout,
     previous_reply_has_output: bool,
     previous_reply_ends_blank: bool,
 ) {
+    let BodyLayout {
+        indent,
+        prose_marker,
+        bg,
+        width,
+    } = layout;
     // `Some((language, collected body))` while inside a fenced block: the body
     // is rendered as ONE unit when the fence closes (or at end of input for a
     // still-streaming block) so highlighting can be memoized per block — the
@@ -1919,6 +1953,14 @@ pub(super) fn push_formatted_body_marked_seeded(
 
         if markdown_table_separator(line) {
             flush_prose_paragraph(lines, palette, &mut prose, indent, bg);
+            // Record that this block HAS a header separator instead of just
+            // dropping the line. `flush_markdown_table` used to infer the
+            // header from row count alone, so a table whose body is empty
+            // (header + `|---|` and nothing else) lost both its divider and
+            // its bold header. An empty row is an unambiguous marker:
+            // `markdown_table_cells` only yields rows of 2+ cells, so a real
+            // row is never empty. The flush strips it before measuring.
+            table.push(Vec::new());
             continue;
         }
 
@@ -2076,7 +2118,13 @@ pub(super) fn flush_markdown_table(
     bg: Option<Color>,
     width: usize,
 ) {
+    // Empty rows are the header-separator markers pushed above; take them as
+    // the header signal, then drop them so they never reach measurement or
+    // rendering. A separator is direct evidence of a header, unlike row count.
+    let saw_separator = table.iter().any(Vec::is_empty);
+    table.retain(|row| !row.is_empty());
     if table.is_empty() {
+        table.clear();
         return;
     }
     let col_count = table.iter().map(Vec::len).max().unwrap_or(0);
@@ -2115,7 +2163,10 @@ pub(super) fn flush_markdown_table(
     let border = style_bg(palette.border(), bg);
     let bold = style_bg(palette.title().add_modifier(Modifier::BOLD), bg);
     let code = style_bg(palette.selected(), bg);
-    let has_header = table.len() > 1;
+    // A `|---|` separator proves the first row is a header even when no body
+    // row followed it. Row count remains the fallback for tables written
+    // without a separator at all.
+    let has_header = saw_separator || table.len() > 1;
 
     lines.push(table_border_line(
         indent, &widths, '┌', '┬', '┐', border, bg, width,
