@@ -2,11 +2,18 @@
 //! (`specs/task-onboarding-exit-and-existing-profile.spec`).
 //!
 //! The first-launch wizard auto-opens and deliberately swallows Esc (closing
-//! it would strand the user on an empty screen), so it MUST offer visible
-//! ways out: an "use existing profile (ID)" edit row that routes the wizard
-//! straight to provider setup, and an explicit Exit row. Both reuse existing
-//! machinery (`/onboard profile` → `SetProfileId`, `LocalAction::Exit` →
-//! `exit_requested`) — these tests pin the discoverability surface.
+//! it would strand the user on an empty screen), so it MUST offer a visible
+//! way out: an explicit Exit row (`LocalAction::Exit` → `exit_requested`).
+//! These tests pin that discoverability surface.
+//!
+//! The spec originally also required a "use existing profile (ID)" edit ROW.
+//! That row was deliberately removed in 70183a1 ("declutter create/provider
+//! steps"): choosing an existing profile is the startup picker's job, and this
+//! create step is only ever reached to make a NEW one, so the row was
+//! confusing. The ROUTE it provided is untouched — `/onboard profile <id>`
+//! still short-circuits straight to provider setup, which
+//! `existing_profile_id_skips_creation_step` below pins. Only the menu row is
+//! gone, so only the discoverability assertion changed.
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use octos_core::ui_protocol::UiProtocolCapabilities;
@@ -88,17 +95,22 @@ fn key(code: KeyCode) -> Event {
 }
 
 #[test]
-fn onboarding_create_menu_offers_existing_profile_row() {
+fn onboarding_create_menu_offers_a_visible_exit_row() {
     let store = first_launch_store();
 
     let ids = active_menu_item_ids(&store);
     assert!(
-        ids.iter().any(|id| id == "onboard.local.profile_id"),
-        "create form must offer the existing-profile edit row; items: {ids:?}"
-    );
-    assert!(
         ids.iter().any(|id| id == "onboard.local.exit"),
-        "create form must offer a visible exit row; items: {ids:?}"
+        "the wizard swallows Esc, so it must offer a visible exit row; items: {ids:?}"
+    );
+    // The existing-profile row was intentionally dropped (see the module doc).
+    // Asserted rather than merely omitted so re-adding it is a deliberate
+    // decision that updates this contract, not an accidental regression of a
+    // decluttering fix.
+    assert!(
+        !ids.iter().any(|id| id == "onboard.local.profile_id"),
+        "the existing-profile row belongs to the startup picker, not the create \
+         step — if it is back, update the spec and this contract; items: {ids:?}"
     );
 }
 

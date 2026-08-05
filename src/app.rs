@@ -899,8 +899,15 @@ const COMPOSER_CHROME_ROWS: u16 = 4;
 const COMPOSER_MIN_HEIGHT: u16 = 5;
 const COMPOSER_MAX_INPUT_ROWS: u16 = 12;
 const COMPOSER_SIDE_COLUMNS: u16 = 6;
+/// A focused peer is a READ-ONLY watch surface: it has no editable composer, so
+/// it reserves a single dim status row (steer peers from the master) instead of
+/// the full bordered box — the reclaimed rows go to the peer's transcript.
+const PEER_READONLY_BAR_ROWS: u16 = 1;
 
 fn composer_height_for_size(app: &AppState, terminal_width: u16, terminal_height: u16) -> u16 {
+    if app.focused_session_is_peer() {
+        return PEER_READONLY_BAR_ROWS;
+    }
     match app.composer_presentation() {
         ComposerPresentation::Inline(text) => {
             COMPOSER_CHROME_ROWS
@@ -4029,6 +4036,27 @@ fn peer_strip_peer_rows(app: &AppState, terminal_height: u16) -> u16 {
         .min(terminal_height.saturating_sub(PEER_STRIP_MIN_TERMINAL_ROWS))
 }
 
+/// The peer session keys whose rows the Peer Dock ACTUALLY DRAWS at
+/// `terminal_height` this frame — the roster prefix `peer_strip_lines` renders
+/// (`roster.iter().take(rows)`), or empty when the dock is collapsed (the pill
+/// shows no per-peer affordance) or height-0 (pager active / terminal too short
+/// / no peers). Used to gate the dock's approve/deny keys so a peer whose ⚠
+/// affordance is off-screen (below the row cap) or hidden can't be actioned.
+pub(crate) fn visible_peer_dock_keys(
+    app: &AppState,
+    terminal_height: u16,
+) -> Vec<octos_core::SessionKey> {
+    if app.peer_dock_collapsed || peer_strip_height(app, terminal_height) == 0 {
+        return Vec::new();
+    }
+    let rows = peer_strip_peer_rows(app, terminal_height) as usize;
+    peer_dock_roster(app)
+        .into_iter()
+        .take(rows)
+        .map(|(session_id, _)| session_id.clone())
+        .collect()
+}
+
 /// #407: logical lines for the vertical Peer Dock. Row 0 is the title row
 /// (the collapsed pill when `peer_dock_collapsed`). Each following row is
 /// one peer: glyph (⚠ blocked / ✻ live / ○ idle) + slug + muted activity
@@ -4127,6 +4155,22 @@ pub(crate) fn peer_strip_lines(
             row_spans.push(Span::styled(
                 format!(" · ↓ {}", humanize_token_count(*output)),
                 palette.muted().bg(palette.surface),
+            ));
+        }
+        // Peer operator console: a peer with a stashed approval gets an
+        // actionable affordance on its row so the operator answers it from the
+        // master via Alt+Y / Alt+N (see the event loop) WITHOUT switching to the
+        // peer. Only APPROVALS get the yes/no affordance (a question-blocked peer
+        // needs the picker); the ⚠ glyph + `peer_activity_line` already carry the
+        // reason. Kept INLINE — no extra line — so the one-row-per-peer height
+        // reservation (`peer_strip_height`) stays exact.
+        if app.pending_session_approvals.contains_key(*session_id) {
+            row_spans.push(Span::styled(
+                "  [Alt+Y approve · Alt+N deny]".to_string(),
+                Style::default()
+                    .fg(palette.highlight)
+                    .bg(palette.surface)
+                    .add_modifier(Modifier::BOLD),
             ));
         }
         lines.push(Line::from(row_spans));
@@ -4643,7 +4687,10 @@ fn model_context_window_hint(app: &AppState, session_id: &SessionKey) -> u64 {
 }
 
 fn set_composer_cursor(frame: &mut impl FrameLike, app: &AppState, area: Rect) {
-    if app.focus != FocusPane::Composer {
+    // No caret on a read-only peer bar (there is no input surface). The height-1
+    // area already yields None from `composer_cursor_position`; this is the
+    // explicit intent guard.
+    if app.focus != FocusPane::Composer || app.focused_session_is_peer() {
         return;
     }
     if let Some(position) = composer_cursor_position(app, area) {
