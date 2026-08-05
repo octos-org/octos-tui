@@ -504,6 +504,7 @@ status:
   research_rm_usage: "Usage: /research rm <key>"
   research_profile_unresolved: "Active profile not resolved yet — try again once the session is ready."
   research_lane_saved: "Research lane %{key} saved: %{label} — restart to apply."
+  sub_provider_restart_required: "%{message} — restart to apply."
   opening_diff_preview: "Opening diff preview: %{operation} %{path}"
   opening_inline_diff_preview: "Opening inline diff preview: %{title}"
   approval_requested: "Approval requested: %{title}"

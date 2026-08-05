@@ -1252,6 +1252,7 @@ status:
   research_rm_usage: "用法：/research rm <key>"
   research_profile_unresolved: "当前档案尚未就绪 —— 请在会话准备好后重试。"
   research_lane_saved: "研究通道 %{key} 已保存：%{label} —— 需重启生效。"
+  sub_provider_restart_required: "%{message} —— 需重启生效。"
   opening_diff_preview: "正在打开差异预览：%{operation} %{path}"
   opening_inline_diff_preview: "正在打开内联差异预览：%{title}"
   approval_requested: "请求审批：%{title}"
