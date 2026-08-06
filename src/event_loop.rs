@@ -1481,24 +1481,50 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
                 return KeyAction::send(command);
             }
         }
-        KeyCode::Char('d') if store.state.focus != FocusPane::Composer => {
+        // Diff-view keys: two gates must both pass —
+        //   1. diff_preview.active: the diff pane is open (set by
+        //      open_loading, cleared by close/Esc). Without this the keys
+        //      fall through to the composer as text input.
+        //   2. focus != Composer: the user is NOT typing in the composer.
+        //      Without this, typing `v`, `c`, `[`, `]` into the composer
+        //      would hijack the keys instead of inserting characters.
+        // Previously these were gated on focus alone, which made them dead
+        // because focus never leaves Composer in normal use (Tab cycles
+        // sub-agent peek, not panes). The diff_preview.active gate makes
+        // them available from ANY non-composer pane (Transcript, Git, etc).
+        // `d` opens the diff preview (first press) and re-reads it (while
+        // already open). The approval modal has its own `d` arm upstream
+        // (handle_approval_key), so this arm only fires outside the modal.
+        KeyCode::Char('d')
+            if store.state.diff_preview.active
+                || (store.state.focus != FocusPane::Composer
+                    && store.state.active_diff_preview_id().is_some()) =>
+        {
             if let Some(command) = store.read_diff_preview_command() {
                 return KeyAction::send(command);
             }
         }
-        KeyCode::Char(']') if store.state.focus != FocusPane::Composer => {
+        KeyCode::Char(']')
+            if store.state.diff_preview.active
+                && store.state.focus != FocusPane::Composer =>
+        {
             store.select_next_diff_hunk();
         }
-        KeyCode::Char('[') if store.state.focus != FocusPane::Composer => {
+        KeyCode::Char('[')
+            if store.state.diff_preview.active
+                && store.state.focus != FocusPane::Composer =>
+        {
             store.select_prev_diff_hunk();
         }
         KeyCode::Char('c')
-            if store.state.focus != FocusPane::Composer && store.state.diff_preview.active =>
+            if store.state.diff_preview.active
+                && store.state.focus != FocusPane::Composer =>
         {
             store.stage_selected_diff_context();
         }
         KeyCode::Char('v')
-            if store.state.focus != FocusPane::Composer && store.state.diff_preview.active =>
+            if store.state.diff_preview.active
+                && store.state.focus != FocusPane::Composer =>
         {
             store.toggle_diff_view_mode();
         }

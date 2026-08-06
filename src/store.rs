@@ -7060,6 +7060,11 @@ impl Store {
         };
 
         self.state.diff_preview.open_loading(preview_id.clone());
+        // Move focus out of the composer so the diff-view keys
+        // (`[`/`]`/`c`/`v`) become active — they are gated on
+        // `focus != FocusPane::Composer` to preserve text input.
+        // Esc (close_modal) restores focus to Composer.
+        self.state.focus = FocusPane::Transcript;
         self.state.status = t!("status.requested_diff_preview").into_owned();
         Some(AppUiCommand::GetDiffPreview(DiffPreviewGetParams {
             session_id,
