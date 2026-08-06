@@ -744,6 +744,12 @@ menu:
         desc: 移动到下一行。
       menu_previous:
         desc: 移动到上一行。
+      diff_open_toggle:
+        desc: 打开 diff 预览；打开后切换 统一/并排 视图。
+      diff_stage_hunk:
+        desc: 将选中的 diff hunk 暂存为 composer 提示词。
+      diff_next_prev_hunk:
+        desc: 移动到下一个/上一个 diff hunk。
     preview_body: 此视图展示菜单层面的按键。持久化按键编辑将在后续版本提供。
     preview_title: 编辑
     search: 筛选按键绑定

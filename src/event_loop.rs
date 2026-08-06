@@ -858,6 +858,53 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         return KeyAction::Continue;
     }
 
+    // Diff preview (Alt+V family): the always-available path, usable from ANY
+    // focus. The plain `d`/`[`/`]`/`c`/`v` keys are deliberately gated on
+    // `focus != Composer` (#485) — a bare letter cannot be both text and a
+    // command — which leaves the composer, the most common focus, with no way
+    // in. These modified binds are that way in.
+    //
+    // Alt+V is two-in-one: open the preview when closed, toggle
+    // unified <-> side-by-side when open. Alt+C stages the selected hunk,
+    // Alt+N / Alt+M walk hunks; those three are gated on the preview being
+    // active so the binds stay free otherwise.
+    //
+    // NOT Alt+D — the composer readline layer claims it as
+    // delete-word-forward (see the Agent Dock note below).
+    if is_alt_char(&key, 'v') {
+        if store.state.diff_preview.active {
+            store.toggle_diff_view_mode();
+            return KeyAction::Continue;
+        }
+        // `read_diff_preview_command` moves focus to Transcript so the PLAIN
+        // keys become reachable. That is right for the `d` path but wrong
+        // here: the point of the Alt family is that it works without leaving
+        // the composer, and yanking focus mid-typing would strand the draft.
+        // Restore whatever focus the user had.
+        let focus_before = store.state.focus;
+        let command = store.read_diff_preview_command();
+        store.state.focus = focus_before;
+        if let Some(command) = command {
+            return KeyAction::send(command);
+        }
+        return KeyAction::Continue;
+    }
+
+    if is_alt_char(&key, 'c') && store.state.diff_preview.active {
+        store.stage_selected_diff_context();
+        return KeyAction::Continue;
+    }
+
+    if is_alt_char(&key, 'n') && store.state.diff_preview.active {
+        store.select_next_diff_hunk();
+        return KeyAction::Continue;
+    }
+
+    if is_alt_char(&key, 'm') && store.state.diff_preview.active {
+        store.select_prev_diff_hunk();
+        return KeyAction::Continue;
+    }
+
     // Agent Dock (#323): Ctrl+G/Alt+G toggles the sub-agent strip between the
     // one-line summary pill and the per-agent rows. NOT Alt+D — the composer
     // claims that as readline delete-word-forward (handle_composer_modified_key
@@ -6126,6 +6173,139 @@ mod tests {
             "Esc closes the diff surface, not just the focus"
         );
         assert_eq!(store.state.focus, FocusPane::Composer);
+    }
+
+    /// The Alt family is the counterpart to #485: because the plain keys must
+    /// stay literal text in the composer, the composer would otherwise have no
+    /// way to reach the diff surface at all. Alt+V toggles view mode with the
+    /// preview open, from composer focus.
+    #[test]
+    fn alt_v_toggles_view_mode_from_composer_focus() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        let session_id = store.state.sessions[0].id.clone();
+        store
+            .state
+            .diff_preview
+            .apply_result(diff_result_with_two_hunks(session_id));
+        assert!(store.state.diff_preview.active);
+        assert!(!store.state.diff_preview.side_by_side);
+
+        let action = handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('v'), KeyModifiers::ALT),
+        );
+
+        assert!(matches!(action, KeyAction::Continue));
+        assert!(
+            store.state.diff_preview.side_by_side,
+            "Alt+V must toggle side-by-side even with the composer focused"
+        );
+        assert_eq!(
+            store.state.composer, "",
+            "Alt+V must not leak a literal 'v' into the composer"
+        );
+    }
+
+    /// Opening via the plain `d` path deliberately moves focus to Transcript so
+    /// the plain keys become reachable. Alt+V must NOT do that — its whole
+    /// purpose is working without leaving the composer, and yanking focus
+    /// mid-typing would strand the draft.
+    #[test]
+    fn alt_v_opens_the_preview_without_stealing_composer_focus() {
+        let preview_id = PreviewId::new();
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        store.state.sessions[0].tasks.push(TaskView {
+            id: TaskId::new(),
+            title: "diff".into(),
+            state: TaskRuntimeState::Running,
+            runtime_detail: Some(format!("preview_id={}", preview_id.0)),
+            output_tail: String::new(),
+            turn_id: None,
+        });
+        assert!(!store.state.diff_preview.active);
+
+        let action = handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('v'), KeyModifiers::ALT),
+        );
+
+        let AppUiCommand::GetDiffPreview(params) = sent_command(action) else {
+            panic!("Alt+V must fire the same GetDiffPreview RPC as the `d` path");
+        };
+        assert_eq!(params.preview_id, preview_id);
+        assert!(store.state.diff_preview.active);
+        assert_eq!(
+            store.state.focus,
+            FocusPane::Composer,
+            "Alt+V must leave focus where it found it"
+        );
+    }
+
+    #[test]
+    fn alt_c_stages_the_selected_hunk_from_composer_focus() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        let session_id = store.state.sessions[0].id.clone();
+        store
+            .state
+            .diff_preview
+            .apply_result(diff_result_with_two_hunks(session_id));
+
+        handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('c'), KeyModifiers::ALT),
+        );
+
+        assert!(
+            store.state.composer.contains("src/lib.rs"),
+            "Alt+C must stage the hunk into the composer, got: {:?}",
+            store.state.composer
+        );
+    }
+
+    #[test]
+    fn alt_n_and_alt_m_walk_hunks_from_composer_focus() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        let session_id = store.state.sessions[0].id.clone();
+        store
+            .state
+            .diff_preview
+            .apply_result(diff_result_with_two_hunks(session_id));
+        assert_eq!(store.state.diff_preview.selected_hunk, 0);
+
+        handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('n'), KeyModifiers::ALT),
+        );
+        assert_eq!(store.state.diff_preview.selected_hunk, 1, "Alt+N advances");
+
+        handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('m'), KeyModifiers::ALT),
+        );
+        assert_eq!(store.state.diff_preview.selected_hunk, 0, "Alt+M goes back");
+    }
+
+    /// With no preview open, Alt+C/N/M must stay free rather than silently
+    /// swallowing the keystroke.
+    #[test]
+    fn alt_hunk_keys_are_inert_when_no_preview_is_open() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        assert!(!store.state.diff_preview.active);
+
+        for ch in ['c', 'n', 'm'] {
+            handle_key(
+                &mut store,
+                modified_key(KeyCode::Char(ch), KeyModifiers::ALT),
+            );
+        }
+
+        assert!(!store.state.diff_preview.active);
+        assert_eq!(store.state.diff_preview.selected_hunk, 0);
     }
 
     #[test]

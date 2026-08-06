@@ -1222,6 +1222,12 @@ menu:
         desc: Move to next row.
       menu_previous:
         desc: Move to previous row.
+      diff_open_toggle:
+        desc: Open diff preview; toggle unified/side-by-side when open.
+      diff_stage_hunk:
+        desc: Stage the selected diff hunk as a composer prompt.
+      diff_next_prev_hunk:
+        desc: Walk to the next/previous diff hunk.
     preview_body: This slice exposes the menu surface. Persisted keymap editing remains a follow-up provider action.
     preview_title: Editing
     search: Filter key bindings
