@@ -10,7 +10,7 @@
 ╚██████╔╝╚██████╗   ██║   ╚██████╔╝███████║
  ╚═════╝  ╚═════╝   ╚═╝    ╚═════╝ ╚══════╝
 </pre>
-<em>Welcome to Octos-TUI — Your Coding Buddy</em>
+<em>Welcome to Octoscode — Your Coding Buddy</em>
 </div>
 
 `octoscode` is the terminal app for [Octos](https://github.com/octos-org/octos)

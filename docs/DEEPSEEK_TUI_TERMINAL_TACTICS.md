@@ -1,12 +1,12 @@
-# DeepSeek-TUI Terminal Tactics For Octos-TUI
+# DeepSeek-TUI Terminal Tactics For Octoscode
 
 Issues: #13, #14, #15, #16, #17, #18, #19
 
-This document captures what Octos-TUI should learn from DeepSeek-TUI while keeping Octos runtime ownership in `octos` and the AppUI protocol. The goal is Rust terminal implementation quality, not moving model routing, memory, sandboxing, tool registration, or approval policy into the TUI.
+This document captures what Octoscode should learn from DeepSeek-TUI while keeping Octos runtime ownership in `octos` and the AppUI protocol. The goal is Rust terminal implementation quality, not moving model routing, memory, sandboxing, tool registration, or approval policy into the TUI.
 
 ## Ownership Boundary
 
-Octos-TUI should own:
+Octoscode should own:
 
 - terminal rendering and input ergonomics
 - capability-aware command/menu presentation
@@ -23,7 +23,7 @@ Octos/AppUI should own:
 
 ## Tactics To Apply
 
-| Area | DeepSeek-TUI tactic | Octos-TUI application | Issue |
+| Area | DeepSeek-TUI tactic | Octoscode application | Issue |
 | --- | --- | --- | --- |
 | Tool cards | Keep tool execution visually grouped with command, status, preview, and result. | Render AppUI tool start/progress/complete events as structured cards with stable activity labels and folded long output. | #14 |
 | Approvals | Make blocked actions visually distinct and keep the decision target close to the relevant command/diff. | Render typed approval cards with risk, scope, decision state, and diff preview linkage. | #15 |
@@ -49,6 +49,6 @@ Octos/AppUI should own:
 
 ## Non-Goals
 
-- Do not import DeepSeek-TUI provider ownership into Octos-TUI.
+- Do not import DeepSeek-TUI provider ownership into Octoscode.
 - Do not bypass AppUI for tools, memory, sandbox, profile state, or approvals.
 - Do not make live-provider output required for normal regression tests.

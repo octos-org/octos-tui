@@ -4,7 +4,7 @@ Status: proposed
 
 ## Purpose
 
-Octos TUI currently has local one-off slash handlers for `/ps`, `/stop`, and
+Octoscode currently has local one-off slash handlers for `/ps`, `/stop`, and
 `/help`. That is not enough for Codex-style coding UX. Codex has a reusable
 command registry, slash autocomplete popup, selection-list framework,
 multi-select framework, nested submenu flow, and specialized menus for model

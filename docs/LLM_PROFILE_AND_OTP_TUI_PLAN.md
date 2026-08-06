@@ -1,4 +1,4 @@
-# Octos TUI Login And LLM Provider UX PRD
+# Octoscode Login And LLM Provider UX PRD
 
 ## Purpose
 

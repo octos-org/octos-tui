@@ -1817,7 +1817,7 @@ mod tests {
 
         let text = rendered_text(&app);
 
-        assert!(!text.contains("Octos TUI"));
+        assert!(!text.contains("Octoscode"));
         assert!(!text.contains("Protocol session"));
         assert!(!text.contains("ws://"));
         assert!(!text.contains("Transcript"));

@@ -174,7 +174,7 @@ fn version_string() -> &'static str {
 #[command(
     name = "octoscode",
     version = version_string(),
-    about = "Mock-backed Octos TUI prototype on the Octos UI Protocol boundary",
+    about = "Mock-backed Octoscode prototype on the Octos UI Protocol boundary",
     // These leading positionals are handled before clap (see `cmd::dispatch`),
     // so they don't appear as clap subcommands above. (Profiles are created in
     // the TUI — first-launch onboarding, or `/profiles` → "Create a new profile".)
