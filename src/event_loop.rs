@@ -1318,11 +1318,24 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         KeyCode::Esc if store.state.transcript_pager_active => {
             store.state.exit_transcript_pager();
         }
-        // Side-pane focus (only reachable via `/ps` / `!cmd` now that Tab no
-        // longer cycles panes): Esc simply returns focus to the composer.
-        // Without this arm the plain-Esc handler below would fire and
-        // INTERRUPT a running turn — a destructive exit from a read-only
-        // inspection pane (codex final-gate P2).
+        // An open diff preview owns Esc: close the surface AND return focus.
+        // This must sit ABOVE the side-pane arm below, which only refocuses.
+        // Without it `diff_preview.active` stays set forever — `close_modal`'s
+        // `diff_preview.close()` is unreachable from the keyboard whenever the
+        // diff is the only active surface (its ladder returns early on any
+        // visible approval/question/detail pane first), so a stuck `active`
+        // bit would keep the `d` arm hijacking the letter for the rest of the
+        // session.
+        KeyCode::Esc if store.state.diff_preview.active => {
+            store.state.diff_preview.close();
+            store.state.focus = FocusPane::Composer;
+        }
+        // Side-pane focus (reachable via `/ps` / `!cmd`, and via the diff
+        // preview above, now that Tab no longer cycles panes): Esc simply
+        // returns focus to the composer. Without this arm the plain-Esc
+        // handler below would fire and INTERRUPT a running turn — a
+        // destructive exit from a read-only inspection pane (codex
+        // final-gate P2).
         KeyCode::Esc if store.state.focus != FocusPane::Composer => {
             store.state.focus = FocusPane::Composer;
         }
@@ -1495,36 +1508,38 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         // `d` opens the diff preview (first press) and re-reads it (while
         // already open). The approval modal has its own `d` arm upstream
         // (handle_approval_key), so this arm only fires outside the modal.
+        // `focus != Composer` gates BOTH paths. Putting it only on the
+        // open path (and letting a bare `diff_preview.active` reach the
+        // reload path) makes the letter `d` untypeable while a preview is
+        // open: `c` returns focus to the composer without closing the
+        // preview, as do approval arrival and file-mutation events, so
+        // typing "done" yields "one" and yanks focus to the transcript.
         KeyCode::Char('d')
-            if store.state.diff_preview.active
-                || (store.state.focus != FocusPane::Composer
-                    && store.state.active_diff_preview_id().is_some()) =>
+            if store.state.focus != FocusPane::Composer
+                && (store.state.diff_preview.active
+                    || store.state.active_diff_preview_id().is_some()) =>
         {
             if let Some(command) = store.read_diff_preview_command() {
                 return KeyAction::send(command);
             }
         }
         KeyCode::Char(']')
-            if store.state.diff_preview.active
-                && store.state.focus != FocusPane::Composer =>
+            if store.state.diff_preview.active && store.state.focus != FocusPane::Composer =>
         {
             store.select_next_diff_hunk();
         }
         KeyCode::Char('[')
-            if store.state.diff_preview.active
-                && store.state.focus != FocusPane::Composer =>
+            if store.state.diff_preview.active && store.state.focus != FocusPane::Composer =>
         {
             store.select_prev_diff_hunk();
         }
         KeyCode::Char('c')
-            if store.state.diff_preview.active
-                && store.state.focus != FocusPane::Composer =>
+            if store.state.diff_preview.active && store.state.focus != FocusPane::Composer =>
         {
             store.stage_selected_diff_context();
         }
         KeyCode::Char('v')
-            if store.state.diff_preview.active
-                && store.state.focus != FocusPane::Composer =>
+            if store.state.diff_preview.active && store.state.focus != FocusPane::Composer =>
         {
             store.toggle_diff_view_mode();
         }
@@ -6058,6 +6073,59 @@ mod tests {
         assert_eq!(params.preview_id, preview_id);
         assert!(store.state.diff_preview.active);
         assert_eq!(store.state.status, "Requested diff preview");
+    }
+
+    /// The `d` arm must require non-composer focus on BOTH of its paths.
+    /// Gating only the open path — and letting a bare `diff_preview.active`
+    /// reach the reload path — makes the letter `d` untypeable while a
+    /// preview is open. That state is ordinary, not exotic: `c` (stage
+    /// hunk) returns focus to the composer without closing the preview, as
+    /// do approval arrival and file-mutation progress events. Typing "done"
+    /// would then yield "one" and yank focus to the transcript.
+    #[test]
+    fn d_stays_literal_text_in_the_composer_while_a_diff_preview_is_open() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        store.state.diff_preview.open_loading(PreviewId::new());
+        assert!(
+            store.state.diff_preview.active,
+            "precondition: the preview is open"
+        );
+
+        for ch in "done".chars() {
+            handle_key(&mut store, key(KeyCode::Char(ch)));
+        }
+
+        assert_eq!(
+            store.state.composer, "done",
+            "every typed letter must reach the composer, `d` included"
+        );
+        assert_eq!(
+            store.state.focus,
+            FocusPane::Composer,
+            "typing must not yank focus out of the composer"
+        );
+    }
+
+    /// Esc must CLOSE an open diff preview, not merely refocus. The only
+    /// `diff_preview.close()` lives in `close_modal`, whose ladder returns
+    /// early on any visible approval/question/detail pane — so when the diff
+    /// is the sole active surface the keyboard can never reach it, and the
+    /// `active` bit would stick for the rest of the session.
+    #[test]
+    fn esc_closes_an_open_diff_preview_and_returns_focus_to_the_composer() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Transcript;
+        store.state.diff_preview.open_loading(PreviewId::new());
+        assert!(store.state.diff_preview.active);
+
+        handle_key(&mut store, key(KeyCode::Esc));
+
+        assert!(
+            !store.state.diff_preview.active,
+            "Esc closes the diff surface, not just the focus"
+        );
+        assert_eq!(store.state.focus, FocusPane::Composer);
     }
 
     #[test]
