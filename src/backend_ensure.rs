@@ -631,7 +631,26 @@ fn have(program: &str) -> bool {
 /// **BUMP THIS whenever you bump the `octos-core` rev in Cargo.toml**, to the
 /// octos release tag that contains that rev. Override for a fork / pinned test
 /// build with [`OCTOS_RELEASE_ENV`].
-pub(crate) const REQUIRED_OCTOS_RELEASE: &str = "v2.0.2";
+///
+/// That instruction was followed by hand and drifted: the rev moved to
+/// v2.0.3-rc.1 while this stayed on v2.0.2, so a fresh install auto-provisioned
+/// a server whose protocol predated the client's. [`REQUIRED_OCTOS_CORE_REV`]
+/// and the test beside it now make the pair checkable instead of a comment.
+pub(crate) const REQUIRED_OCTOS_RELEASE: &str = "v2.0.3-rc.1";
+
+/// The `octos-core` rev that [`REQUIRED_OCTOS_RELEASE`] resolves to — i.e. the
+/// commit the release tag points at, and the rev Cargo.toml must pin.
+///
+/// These are two halves of one decision (which server protocol this client
+/// speaks) held in two files, with only a doc comment joining them. Recording
+/// the rev here lets `octos_release_pin_matches_cargo_core_rev` fail when they
+/// disagree, so bumping Cargo.toml without revisiting the release tag is caught
+/// at test time rather than by a user getting a mismatched auto-provision.
+///
+/// Test-only: its whole job is to be compared against Cargo.toml, so it would
+/// be dead weight in a real build.
+#[cfg(test)]
+pub(crate) const REQUIRED_OCTOS_CORE_REV: &str = "725451747f3cbc33bf76ee57320af6c2c78d0567";
 /// Env var overriding the octos release tag to install (fork / pinned build).
 const OCTOS_RELEASE_ENV: &str = "OCTOSCODE_OCTOS_RELEASE";
 /// The octos server-bundle asset name for THIS build's target platform, or
@@ -1226,6 +1245,52 @@ mod tests {
             opt_out_from(set(""), set("1")),
             OptOut::Legacy,
             "empty current falls through to a real legacy value"
+        );
+    }
+
+    /// The octos-core rev in Cargo.toml and the release tag we auto-provision
+    /// are two halves of ONE decision — which server protocol this client
+    /// speaks — living in two files, joined only by a doc comment saying "bump
+    /// this too". That drifted: the rev reached v2.0.3-rc.1 while
+    /// REQUIRED_OCTOS_RELEASE stayed at v2.0.2, so a fresh install provisioned
+    /// a server older than the protocol the client had been built against.
+    ///
+    /// Reading Cargo.toml at test time turns the comment into a check.
+    #[test]
+    fn octos_release_pin_matches_cargo_core_rev() {
+        let manifest = include_str!("../Cargo.toml");
+        let line = manifest
+            .lines()
+            .find(|l| l.trim_start().starts_with("octos-core"))
+            .expect("Cargo.toml declares an octos-core dependency");
+
+        let rev = line
+            .split("rev")
+            .nth(1)
+            .and_then(|rest| rest.split('"').nth(1))
+            .expect("the octos-core dependency pins an explicit rev");
+
+        assert_eq!(
+            rev, REQUIRED_OCTOS_CORE_REV,
+            "Cargo.toml pins octos-core at {rev}, but backend_ensure records \
+             {REQUIRED_OCTOS_CORE_REV} as the rev behind \
+             REQUIRED_OCTOS_RELEASE ({REQUIRED_OCTOS_RELEASE}).\n\
+             \n\
+             If you bumped the rev, also bump REQUIRED_OCTOS_RELEASE to the \
+             octos release tag containing it, and update \
+             REQUIRED_OCTOS_CORE_REV to match. Otherwise a fresh install \
+             auto-provisions a server whose protocol disagrees with this \
+             client."
+        );
+    }
+
+    /// A release tag, not a bare version — the auto-installer builds download
+    /// URLs from it (`releases/download/<tag>/…`).
+    #[test]
+    fn octos_release_pin_is_a_tag() {
+        assert!(
+            REQUIRED_OCTOS_RELEASE.starts_with('v'),
+            "REQUIRED_OCTOS_RELEASE must be a tag like `v2.0.3-rc.1`, got {REQUIRED_OCTOS_RELEASE}"
         );
     }
 }
