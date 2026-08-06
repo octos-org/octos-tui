@@ -11,7 +11,7 @@ estimate: 0.5d
 Livediff's most transferable idea is not its file watcher architecture, but the
 way it makes a diff scannable: a compact file badge, visible `+/-` counts,
 strong file/hunk headers, and selection that lands on the first real change.
-Apply those local rendering patterns to octos-tui's inline AppUI diff preview.
+Apply those local rendering patterns to octoscode's inline AppUI diff preview.
 
 ## Decisions
 

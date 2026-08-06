@@ -4,7 +4,7 @@ Status: proposed, not part of AppUi/UI Protocol 1.0.
 
 ## Problem
 
-`octos-tui` can render and select local context such as a diff hunk, file path,
+`octoscode` can render and select local context such as a diff hunk, file path,
 selected text, or review comment. Today the only AppUi v1 turn input is text, so
 the TUI must stage selected context as plain prompt text. That is safe for v1,
 but it loses structured context semantics that a backend could use for token
@@ -57,7 +57,7 @@ Attachment types:
 
 ## Current M9.30 Bridge
 
-Until this UPCR is accepted, `octos-tui` uses a v1-compatible bridge:
+Until this UPCR is accepted, `octoscode` uses a v1-compatible bridge:
 
 - `[` and `]` select the previous/next rendered diff hunk.
 - `c` stages the selected hunk as plain text in the composer or pending-message

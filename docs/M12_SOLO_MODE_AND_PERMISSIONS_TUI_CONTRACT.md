@@ -5,7 +5,7 @@ Date: 2026-05-13
 
 ## Goal
 
-Support Octos solo coding sessions in `octos-tui` without making the TUI a
+Support Octos solo coding sessions in `octoscode` without making the TUI a
 runtime-policy authority.
 
 The TUI must render server truth from AppUI. It may request a project cwd or a
@@ -124,8 +124,8 @@ TUI requirements:
 
 ### M12-E: Solo Launch And Project Cwd UX
 
-Repository: `octos-tui`
-Issue: https://github.com/octos-org/octos-tui/issues/29
+Repository: `octoscode`
+Issue: https://github.com/octos-org/octoscode/issues/29
 
 Deliverables:
 
@@ -153,8 +153,8 @@ Acceptance:
 
 ### M12-F: Permission Profile UX
 
-Repository: `octos-tui`
-Issue: https://github.com/octos-org/octos-tui/issues/30
+Repository: `octoscode`
+Issue: https://github.com/octos-org/octoscode/issues/30
 
 Deliverables:
 
@@ -178,8 +178,8 @@ Acceptance:
 
 ### M12-G: Interactive Tmux Soak
 
-Repository: `octos-tui`
-Issue: https://github.com/octos-org/octos-tui/issues/31
+Repository: `octoscode`
+Issue: https://github.com/octos-org/octoscode/issues/31
 
 Deliverables:
 

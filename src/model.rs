@@ -826,7 +826,7 @@ pub enum AppUiCommand {
     ResumeLoop(LoopIdParams),
     FireLoopNow(LoopIdParams),
     /// `!`-bang client-local shell exec (Claude Code's `!` model). Runs a
-    /// native shell command on the machine octos-tui runs on — NOT the
+    /// native shell command on the machine octoscode runs on — NOT the
     /// agent's sandboxed server `shell` tool — so it intentionally bypasses
     /// every server-side guard. Carries NO JSON-RPC method: the transport
     /// intercepts it directly, spawns the command on its tokio runtime, and
@@ -4487,7 +4487,7 @@ pub struct AppState {
     /// the `file-picker` menu build; rebuilt on every `@` (never stale-served).
     pub file_picker: Option<crate::file_picker::FilePickerState>,
     /// Cross-session command history for Up/Down recall (codex/claude-code
-    /// style); persisted to `~/.config/octos-tui/history.jsonl`. See
+    /// style); persisted to `~/.config/octoscode/history.jsonl`. See
     /// [`crate::history::ComposerHistory`].
     pub composer_history: crate::history::ComposerHistory,
     /// Prompts staged while the ACTIVE session's turn was running, submitted
@@ -10274,7 +10274,7 @@ mod tests {
         UiGitStatusItem, UiWorkspacePaneEntry, UiWorkspacePaneSnapshot,
     };
 
-    /// The client's LOCAL launch/resolve types (octos-tui pins an older
+    /// The client's LOCAL launch/resolve types (octoscode pins an older
     /// octos-core, so `LaunchResolveResult`/`LaunchDecisionKind` are hand
     /// mirrored) must decode the EXACT bytes a live `octos serve` emits —
     /// including the omitted `resolved_profile`/`existing_profiles` on the

@@ -8,14 +8,14 @@
 
 use octos_core::ui_protocol::TurnId;
 use octos_core::{Message, SessionKey};
-use octos_tui::app::{
+use octoscode::app::{
     LiveTurnFinalization, finalized_history_lines_range_dedup_live,
     finalized_live_turn_lines_between, next_live_turn_finalization,
 };
-use octos_tui::cli::ThemeName;
-use octos_tui::model::{AppState, LiveReply, SessionView};
-use octos_tui::store::Store;
-use octos_tui::theme::Palette;
+use octoscode::cli::ThemeName;
+use octoscode::model::{AppState, LiveReply, SessionView};
+use octoscode::store::Store;
+use octoscode::theme::Palette;
 
 fn streaming_store(live_text: &str) -> Store {
     let turn_id = TurnId::new();
@@ -99,7 +99,7 @@ fn closed_fence_flushes_as_complete_block() {
         "a closed fence is flushable"
     );
 
-    let previous_empty = octos_tui::app::LiveTurnFinalization::default();
+    let previous_empty = octoscode::app::LiveTurnFinalization::default();
     let lines =
         finalized_live_turn_lines_between(&store.state, palette(), 80, &previous_empty, &next);
     let rendered = lines_text(&lines);
@@ -136,7 +136,7 @@ fn only_first_batch_carries_prose_marker() {
     assert_eq!(next.reply_flushed_text, text);
 
     // Batch 1: from empty watermark — carries the bullet.
-    let empty = octos_tui::app::LiveTurnFinalization::default();
+    let empty = octoscode::app::LiveTurnFinalization::default();
     let first_batch = lines_text(&finalized_live_turn_lines_between(
         &store.state,
         palette(),
@@ -176,7 +176,7 @@ fn commit_suffix_joins_flushed_prefix_without_marker() {
         .messages
         .push(Message::assistant(full));
 
-    let coverage = octos_tui::app::LiveTurnFinalization {
+    let coverage = octoscode::app::LiveTurnFinalization {
         reply_flushed_text: "first block done.\n\n".to_string(),
         ..Default::default()
     };

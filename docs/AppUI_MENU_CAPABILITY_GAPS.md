@@ -4,7 +4,7 @@ This note covers the AppUI-backed slash menus from
 `docs/M9_34_MENU_FRAMEWORK_MILESTONE.md`: `/model`, `/status`,
 `/permissions`, and `/mcp`.
 
-Scope rule: `octos-tui` must not invent server-owned runtime state. When a
+Scope rule: `octoscode` must not invent server-owned runtime state. When a
 required AppUI method or result field is absent, the menu provider should render
 a capability-missing or snapshot-limited state and stop there.
 
@@ -28,7 +28,7 @@ surface plus the menu-backed runtime surface:
 
 `config/capabilities/list` hydrates `UiProtocolCapabilities` into TUI state.
 The registry, exact slash dispatch, help menu, and providers share that
-capability map for gating. `octos-tui doctor --endpoint ...` also probes the
+capability map for gating. `octoscode doctor --endpoint ...` also probes the
 same method live before falling back to the structural local skew check.
 
 ## Menu Gap Matrix

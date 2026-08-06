@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This document is the ground truth for octos-tui onboarding, login, and LLM
+This document is the ground truth for octoscode onboarding, login, and LLM
 provider configuration. Implementation must follow this document before changing
 TUI behavior or AppUI request shapes.
 
@@ -31,7 +31,7 @@ Octos web currently supports email OTP login through:
 
 After OTP verification, the web client stores the returned token, calls
 `/api/auth/me`, and persists the selected profile id from the server response.
-For octos-tui, email OTP is the only supported login method for now. Admin token
+For octoscode, email OTP is the only supported login method for now. Admin token
 or API-key login must not appear in the TUI unless a future protocol revision
 explicitly advertises and documents it.
 

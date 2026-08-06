@@ -13,7 +13,7 @@ estimate: 0.5d
 用户若启动时忘传 `--profile-id`，会被迫面对"创建新 profile"表单——尽管
 `/onboard profile <id>` 命令早已支持指定已有 profile 并跳过创建，但界面上
 完全不可发现。本任务在创建 profile 表单中补两行：**"使用已有 profile
-（输入 ID）"** 编辑项与**"退出 octos-tui"**项，把既有能力变成可见选项。
+（输入 ID）"** 编辑项与**"退出 octoscode"**项，把既有能力变成可见选项。
 
 ## 已定决策
 

@@ -310,8 +310,8 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
       # LOCAL CUSTOMIZATION — two-channel npm publish (re-apply after `dist
       # generate`). Stable tags publish to the `latest` dist-tag (the default
-      # `npm i -g @octos-org/octos-tui`); prereleases publish to `next`
-      # (`npm i -g @octos-org/octos-tui@next`) so they NEVER move `latest`.
+      # `npm i -g @octos-org/octoscode`); prereleases publish to `next`
+      # (`npm i -g @octos-org/octoscode@next`) so they NEVER move `latest`.
       - name: Publish to npm (stable -> latest, prerelease -> next)
         run: |
           if [ "$IS_PRERELEASE" = "true" ]; then

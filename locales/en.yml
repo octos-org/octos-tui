@@ -1,4 +1,4 @@
-# octos-tui UI strings — English (source / fallback locale).
+# octoscode UI strings — English (source / fallback locale).
 #
 # Keys are dotted via nested YAML. Add a key here and its translation in
 # zh.yml (and any future locale). Use `%{var}` for interpolation, e.g.
@@ -1338,9 +1338,9 @@ menu:
     item:
       ready:
         label: "Next: start a session with “%{profile}”"
-        desc: "Run `octos-tui` here (this folder is activated for “%{profile}”), or `octos-tui --profile-id %{profile}` from another folder."
+        desc: "Run `octoscode` here (this folder is activated for “%{profile}”), or `octoscode --profile-id %{profile}` from another folder."
         label_generic: "Next: start a session"
-        desc_generic: "Run `octos-tui` here — this folder is now activated for your brain."
+        desc_generic: "Run `octoscode` here — this folder is now activated for your brain."
       open:
         label: "Open a session here now"
         desc: "Start working with “%{profile}” in this folder right now — no relaunch needed."
@@ -1465,7 +1465,7 @@ menu:
         label: Create local profile
       exit:
         desc: "Quit without creating a profile. Tip: launch with --profile-id <id> to skip this screen."
-        label: Exit octos-tui
+        label: Exit octoscode
       local_email:
         desc: Use /onboard email <address>. Email is local metadata only.
       local_name:

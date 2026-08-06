@@ -1,5 +1,5 @@
 //! Inline-viewport driver: owns the scrollback-flush bookkeeping that turns
-//! octos-tui's "rebuild everything every frame" model into codex's "finalized
+//! octoscode's "rebuild everything every frame" model into codex's "finalized
 //! history → scrollback, live UI → inline viewport" model.
 //!
 //! The event loop ([`crate::event_loop`]) calls [`ScrollbackTracker::sync`] each

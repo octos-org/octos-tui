@@ -1,4 +1,4 @@
-//! Terminal detection and color adaptation for octos-tui.
+//! Terminal detection and color adaptation for octoscode.
 //!
 //! Probes the terminal's actual background color via OSC 11 so the `Terminal`
 //! theme can adapt to the user's light/dark terminal preference instead of
@@ -172,7 +172,7 @@ fn probe_default_colors() -> Option<DefaultColors> {
 /// to probe. The OSC probe talks to `/dev/tty` (NOT stdin/stdout), so the
 /// guard checks THAT fd — gating on `stdin`, as the original did, is
 /// inconsistent with what's actually probed: stdin can be piped while the tty
-/// stays interactive (`octos-tui < script`), or a terminal while the process
+/// stays interactive (`octoscode < script`), or a terminal while the process
 /// has no controlling tty. Checking the probe target itself is what keeps the
 /// non-blocking read path from being entered on a fd it can't use.
 #[cfg(unix)]

@@ -99,7 +99,7 @@ pub enum ClientEvent {
     /// RPCs so the store can update its per-session autonomy mirror.
     Autonomy(AutonomyClientEvent),
     /// `!`-bang local-shell completion. Carries the captured output of a
-    /// client-local shell command (run where octos-tui runs, NOT the
+    /// client-local shell command (run where octoscode runs, NOT the
     /// agent's sandboxed server `shell` tool). Surfaced into the same
     /// `queue` that `next_event()` drains, so the synchronous render loop
     /// never blocks on a running command. The store folds this back into

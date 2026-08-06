@@ -81,7 +81,7 @@ estimate: 1d
   测试: default_config_path_resolves_under_config_dir
   假设 未带 --config 启动（无运行时 config 路径）
   当 解析保存回退路径
-  那么 路径位于 ~/.config/octos-tui/config.json（保存写入器据此落盘）
+  那么 路径位于 ~/.config/octoscode/config.json（保存写入器据此落盘）
 
 场景: thinking 不被持久化
   测试: saveconfig_excludes_thinking

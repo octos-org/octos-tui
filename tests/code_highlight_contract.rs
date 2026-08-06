@@ -8,13 +8,13 @@
 
 use octos_core::ui_protocol::TurnId;
 use octos_core::{Message, SessionKey};
-use octos_tui::app::{
+use octoscode::app::{
     LiveTurnFinalization, finalized_live_turn_lines_between, next_live_turn_finalization,
 };
-use octos_tui::cli::ThemeName;
-use octos_tui::model::{AppState, LiveReply, SessionView};
-use octos_tui::store::Store;
-use octos_tui::theme::Palette;
+use octoscode::cli::ThemeName;
+use octoscode::model::{AppState, LiveReply, SessionView};
+use octoscode::store::Store;
+use octoscode::theme::Palette;
 use ratatui::style::Color;
 use ratatui::text::Line;
 
@@ -47,7 +47,7 @@ fn palette() -> Palette {
 /// return the produced lines.
 fn committed_lines(reply: &str) -> Vec<Line<'static>> {
     let store = store_with_committed_reply(reply);
-    octos_tui::app::finalized_history_lines_range_dedup_live(&store.state, palette(), 100, 1, &[])
+    octoscode::app::finalized_history_lines_range_dedup_live(&store.state, palette(), 100, 1, &[])
 }
 
 /// The code-body rows of a rendered block (those carrying the `│ ` frame).

@@ -8,13 +8,13 @@
 use chrono::Utc;
 use octos_core::SessionKey;
 use octos_core::ui_protocol::{HydratedMessage, SessionHydrateResult, TurnId, UiCursor};
-use octos_tui::client_event::ClientEvent;
-use octos_tui::menu::CapabilitySet;
-use octos_tui::model::{
+use octoscode::client_event::ClientEvent;
+use octoscode::menu::CapabilitySet;
+use octoscode::model::{
     APPUI_FEATURE_SESSION_HYDRATE_V1, APPUI_METHOD_SESSION_HYDRATE, AppState, AppUiCommand,
     SessionView,
 };
-use octos_tui::store::Store;
+use octoscode::store::Store;
 
 fn store_with_hydrate_capability() -> Store {
     let session = SessionView {

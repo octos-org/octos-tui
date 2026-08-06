@@ -1,4 +1,4 @@
-//! Install-method detection for `octos-tui update`/`doctor` (design §A.3).
+//! Install-method detection for `octoscode update`/`doctor` (design §A.3).
 //!
 //! The discriminator is the **cargo-dist install receipt**: only the shell and
 //! PowerShell installers write one. If a receipt loads, the binary self-updates
@@ -14,18 +14,18 @@
 
 use std::path::{Path, PathBuf};
 
-/// How this `octos-tui` binary was installed. Drives `update`'s per-method
+/// How this `octoscode` binary was installed. Drives `update`'s per-method
 /// behavior (self-update vs. print-the-command) and `doctor`'s fix lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallMethod {
     /// Installed by the cargo-dist shell/PowerShell installer — a receipt is
     /// present and we can self-update in place.
     CargoDistInstaller,
-    /// Installed via Homebrew (`brew install octos-org/octos-tui/octos-tui`).
+    /// Installed via Homebrew (`brew install octos-org/octoscode/octoscode`).
     Homebrew,
-    /// Installed via npm global (`npm i -g @octos-org/octos-tui`).
+    /// Installed via npm global (`npm i -g @octos-org/octoscode`).
     Npm,
-    /// `cargo install octos-tui` from the crates.io registry.
+    /// `cargo install octoscode` from the crates.io registry.
     CargoRegistry,
     /// `cargo install --git …` from the GitHub repo.
     CargoGit,
@@ -65,18 +65,18 @@ impl InstallMethod {
         match self {
             InstallMethod::CargoDistInstaller => None,
             InstallMethod::Homebrew => {
-                Some("brew update && brew upgrade octos-org/octos-tui/octos-tui")
+                Some("brew update && brew upgrade octos-org/octoscode/octoscode")
             }
-            InstallMethod::Npm => Some("npm update -g @octos-org/octos-tui"),
-            InstallMethod::CargoRegistry => Some("cargo install octos-tui --force"),
+            InstallMethod::Npm => Some("npm update -g @octos-org/octoscode"),
+            InstallMethod::CargoRegistry => Some("cargo install octoscode --force"),
             InstallMethod::CargoGit => {
-                Some("cargo install --git https://github.com/octos-org/octos-tui octos-tui --force")
+                Some("cargo install --git https://github.com/octos-org/octoscode octoscode --force")
             }
             // No package manager owns the binary; suggest converting to a
             // self-updating install via the one-line installer.
             InstallMethod::Unknown => Some(
                 "curl --proto '=https' --tlsv1.2 -LsSf \
-https://github.com/octos-org/octos-tui/releases/latest/download/octos-tui-installer.sh | sh",
+https://github.com/octos-org/octoscode/releases/latest/download/octoscode-installer.sh | sh",
             ),
         }
     }
@@ -90,27 +90,27 @@ https://github.com/octos-org/octos-tui/releases/latest/download/octos-tui-instal
     /// Two-channel scheme (mirrors `dist-workspace.toml` / the release
     /// workflows): stable never moves when you opt into prereleases.
     /// - **npm**: prereleases are published under the `next` dist-tag, so
-    ///   `@octos-org/octos-tui@next` is the latest rc while a bare install and
+    ///   `@octos-org/octoscode@next` is the latest rc while a bare install and
     ///   `@latest` stay stable.
-    /// - **Homebrew**: prereleases are tracked by a SEPARATE `octos-tui-dev`
-    ///   formula in this repo's tap; the stable `octos-tui` formula is untouched.
+    /// - **Homebrew**: prereleases are tracked by a SEPARATE `octoscode-dev`
+    ///   formula in this repo's tap; the stable `octoscode` formula is untouched.
     ///   (`brew install` upgrades in place if the formula has moved.)
     /// - **cargo-dist installer**: `None` — it self-updates in place via
-    ///   `octos-tui update --prerelease` (axoupdater `LatestMaybePrerelease`).
+    ///   `octoscode update --prerelease` (axoupdater `LatestMaybePrerelease`).
     /// - **cargo install / unknown**: `None` — no rc-specific channel; the
     ///   caller points at the universal npm `@next` channel or the installer.
     pub fn prerelease_upgrade_command(&self) -> Option<String> {
         match self {
             // npm: opt into the `next` dist-tag (never `latest`).
-            InstallMethod::Npm => Some("npm install -g @octos-org/octos-tui@next".to_string()),
+            InstallMethod::Npm => Some("npm install -g @octos-org/octoscode@next".to_string()),
             // Homebrew: the separate dev formula in the in-repo tap
-            // (`octos-org/octos-tui`), never the stable `octos-tui` formula.
+            // (`octos-org/octoscode`), never the stable `octoscode` formula.
             InstallMethod::Homebrew => {
-                Some("brew install octos-org/octos-tui/octos-tui-dev".to_string())
+                Some("brew install octos-org/octoscode/octoscode-dev".to_string())
             }
             // Self-updates in place; there is no package-manager command.
             InstallMethod::CargoDistInstaller => None,
-            // crates.io has no prerelease of octos-tui, `--git` already tracks
+            // crates.io has no prerelease of octoscode, `--git` already tracks
             // bleeding-edge main, and nothing owns an Unknown binary — all fall
             // through to the caller's npm `@next` / installer fallback.
             InstallMethod::CargoRegistry | InstallMethod::CargoGit | InstallMethod::Unknown => None,
@@ -152,7 +152,7 @@ pub fn classify_path(input: &PathClassifierInput) -> InstallMethod {
     let exe = &input.current_exe;
 
     // npm global: under an npm root, or any ancestor is a node_modules dir
-    // containing @octos-org/octos-tui.
+    // containing @octos-org/octoscode.
     if input
         .npm_global_roots
         .iter()
@@ -172,7 +172,7 @@ pub fn classify_path(input: &PathClassifierInput) -> InstallMethod {
         return InstallMethod::Homebrew;
     }
 
-    // cargo install destination (`~/.cargo/bin/octos-tui`). Sub-classify by the
+    // cargo install destination (`~/.cargo/bin/octoscode`). Sub-classify by the
     // recorded source from `.crates2.json`.
     if input
         .cargo_bin
@@ -251,11 +251,11 @@ fn detect_with(has_receipt: bool, input: &PathClassifierInput) -> InstallMethod 
 ///
 /// A receipt that loads but points at a *different* install prefix than the
 /// current executable is treated as absent — otherwise a stale receipt in
-/// `~/.config/octos-tui` would mislabel a brew/npm/cargo binary as the
+/// `~/.config/octoscode` would mislabel a brew/npm/cargo binary as the
 /// self-updating installer and we'd try to clobber a file we don't own.
 #[cfg(feature = "update")]
 fn receipt_for_this_executable() -> bool {
-    let mut updater = axoupdater::AxoUpdater::new_for("octos-tui");
+    let mut updater = axoupdater::AxoUpdater::new_for("octoscode");
     if updater.load_receipt().is_err() {
         return false;
     }
@@ -296,7 +296,7 @@ fn live_classifier_input() -> PathClassifierInput {
 /// candidate. `/usr/local`, by contrast, is the classic FHS local prefix that
 /// distro/manual installs share with brew — so we add it **only** when `brew
 /// --prefix` confirms brew actually lives there. Otherwise a manual binary at
-/// `/usr/local/bin/octos-tui` would be misclassified as Homebrew and `update`
+/// `/usr/local/bin/octoscode` would be misclassified as Homebrew and `update`
 /// would print the wrong (brew) command. Binaries under a real Cellar dir still
 /// classify as Homebrew via the `/Cellar/` segment match in [`classify_path`],
 /// independent of these prefixes.
@@ -351,7 +351,7 @@ fn cargo_home() -> Option<PathBuf> {
     home_dir().map(|h| h.join(".cargo"))
 }
 
-/// Inspect `~/.cargo/.crates2.json` for the recorded source of `octos-tui`.
+/// Inspect `~/.cargo/.crates2.json` for the recorded source of `octoscode`.
 /// Returns `Some(true)` if the source is a git URL, `Some(false)` for a
 /// registry source, `None` if not found / unparseable.
 fn cargo_source_is_git() -> Option<bool> {
@@ -361,15 +361,15 @@ fn cargo_source_is_git() -> Option<bool> {
 }
 
 /// Pure core of [`cargo_source_is_git`]: parse the `.crates2.json` content
-/// string and return whether the recorded `octos-tui` source is a git URL.
+/// string and return whether the recorded `octoscode` source is a git URL.
 ///
-/// Keys look like `octos-tui 0.1.1 (registry+https://…)` or
-/// `octos-tui 0.1.1 (git+https://…)`.
+/// Keys look like `octoscode 0.1.1 (registry+https://…)` or
+/// `octoscode 0.1.1 (git+https://…)`.
 fn parse_cargo_source_is_git(contents: &str) -> Option<bool> {
     let value: serde_json::Value = serde_json::from_str(contents).ok()?;
     let installs = value.get("installs")?.as_object()?;
     for key in installs.keys() {
-        if key.starts_with("octos-tui ") {
+        if key.starts_with("octoscode ") {
             return Some(key.contains("(git+"));
         }
     }
@@ -395,7 +395,7 @@ mod tests {
 
     #[test]
     fn should_classify_npm_global_when_under_npm_root() {
-        let mut i = input("/usr/local/lib/node_modules/@octos-org/octos-tui/bin/octos-tui");
+        let mut i = input("/usr/local/lib/node_modules/@octos-org/octoscode/bin/octoscode");
         i.npm_global_roots = vec![PathBuf::from("/usr/local/lib/node_modules")];
         assert_eq!(classify_path(&i), InstallMethod::Npm);
     }
@@ -403,20 +403,20 @@ mod tests {
     #[test]
     fn should_classify_npm_when_node_modules_in_path() {
         // Even without a resolved root, a node_modules ancestor is conclusive.
-        let i = input("/home/u/.nvm/versions/node/v20/lib/node_modules/octos-tui/octos-tui");
+        let i = input("/home/u/.nvm/versions/node/v20/lib/node_modules/octoscode/octoscode");
         assert_eq!(classify_path(&i), InstallMethod::Npm);
     }
 
     #[test]
     fn should_classify_homebrew_when_under_prefix() {
-        let mut i = input("/opt/homebrew/bin/octos-tui");
+        let mut i = input("/opt/homebrew/bin/octoscode");
         i.brew_prefixes = vec![PathBuf::from("/opt/homebrew")];
         assert_eq!(classify_path(&i), InstallMethod::Homebrew);
     }
 
     #[test]
     fn should_classify_homebrew_when_cellar_segment_present() {
-        let i = input("/usr/local/Cellar/octos-tui/0.1.1/bin/octos-tui");
+        let i = input("/usr/local/Cellar/octoscode/0.1.1/bin/octoscode");
         assert_eq!(classify_path(&i), InstallMethod::Homebrew);
     }
 
@@ -424,11 +424,11 @@ mod tests {
     fn should_classify_usr_local_as_unknown_when_no_brew_present() {
         // Regression for finding #1 (symmetric to the npm-prefix bug): with no
         // brew present, `/usr/local` is NOT a Homebrew prefix, so a manual /
-        // distro binary at `/usr/local/bin/octos-tui` must classify as Unknown,
+        // distro binary at `/usr/local/bin/octoscode` must classify as Unknown,
         // not Homebrew (which would print the wrong `brew upgrade` command).
         // `brew_prefixes()` no longer adds `/usr/local` unconditionally; here we
         // model "no brew" by leaving brew_prefixes empty.
-        let i = input("/usr/local/bin/octos-tui");
+        let i = input("/usr/local/bin/octoscode");
         assert_eq!(classify_path(&i), InstallMethod::Unknown);
     }
 
@@ -437,7 +437,7 @@ mod tests {
         // A genuine Homebrew binary lives under `…/Cellar/…`; the `/Cellar/`
         // segment match keeps it classified as Homebrew even when no brew prefix
         // was resolved.
-        let i = input("/opt/homebrew/Cellar/octos-tui/0.1.2/bin/octos-tui");
+        let i = input("/opt/homebrew/Cellar/octoscode/0.1.2/bin/octoscode");
         assert_eq!(classify_path(&i), InstallMethod::Homebrew);
     }
 
@@ -449,7 +449,7 @@ mod tests {
         // `npm root -g` returns), which does NOT contain the Cellar binary — so
         // npm must not win. Had we (wrongly) fed `npm prefix -g`'s `/opt/homebrew`
         // in as a root, npm — checked first — would have stolen this path.
-        let mut i = input("/opt/homebrew/Cellar/octos-tui/0.1.1/bin/octos-tui");
+        let mut i = input("/opt/homebrew/Cellar/octoscode/0.1.1/bin/octoscode");
         i.npm_global_roots = vec![PathBuf::from("/opt/homebrew/lib/node_modules")];
         i.brew_prefixes = vec![PathBuf::from("/opt/homebrew")];
         assert_eq!(classify_path(&i), InstallMethod::Homebrew);
@@ -457,7 +457,7 @@ mod tests {
 
     #[test]
     fn should_classify_cargo_registry_when_in_cargo_bin_without_git_source() {
-        let mut i = input("/home/u/.cargo/bin/octos-tui");
+        let mut i = input("/home/u/.cargo/bin/octoscode");
         i.cargo_bin = Some(PathBuf::from("/home/u/.cargo/bin"));
         i.cargo_source_is_git = Some(false);
         assert_eq!(classify_path(&i), InstallMethod::CargoRegistry);
@@ -465,7 +465,7 @@ mod tests {
 
     #[test]
     fn should_classify_cargo_git_when_source_is_git() {
-        let mut i = input("/home/u/.cargo/bin/octos-tui");
+        let mut i = input("/home/u/.cargo/bin/octoscode");
         i.cargo_bin = Some(PathBuf::from("/home/u/.cargo/bin"));
         i.cargo_source_is_git = Some(true);
         assert_eq!(classify_path(&i), InstallMethod::CargoGit);
@@ -474,20 +474,20 @@ mod tests {
     #[test]
     fn should_default_cargo_to_registry_when_source_unknown() {
         // `.cargo/bin` segment match with no resolved source → registry.
-        let i = input("/home/u/.cargo/bin/octos-tui");
+        let i = input("/home/u/.cargo/bin/octoscode");
         assert_eq!(classify_path(&i), InstallMethod::CargoRegistry);
     }
 
     #[test]
     fn should_classify_unknown_for_distro_path() {
-        let i = input("/usr/bin/octos-tui");
+        let i = input("/usr/bin/octoscode");
         assert_eq!(classify_path(&i), InstallMethod::Unknown);
     }
 
     #[test]
     fn npm_takes_precedence_over_cargo_bin_when_both_match() {
         // node_modules ancestor wins even if a cargo_bin prefix is also set.
-        let mut i = input("/x/.cargo/bin/node_modules/octos-tui/octos-tui");
+        let mut i = input("/x/.cargo/bin/node_modules/octoscode/octoscode");
         i.cargo_bin = Some(PathBuf::from("/x/.cargo/bin"));
         assert_eq!(classify_path(&i), InstallMethod::Npm);
     }
@@ -501,25 +501,25 @@ mod tests {
         );
         assert_eq!(
             InstallMethod::Homebrew.upgrade_command(),
-            Some("brew update && brew upgrade octos-org/octos-tui/octos-tui")
+            Some("brew update && brew upgrade octos-org/octoscode/octoscode")
         );
         assert_eq!(
             InstallMethod::Npm.upgrade_command(),
-            Some("npm update -g @octos-org/octos-tui")
+            Some("npm update -g @octos-org/octoscode")
         );
         assert_eq!(
             InstallMethod::CargoRegistry.upgrade_command(),
-            Some("cargo install octos-tui --force")
+            Some("cargo install octoscode --force")
         );
         assert_eq!(
             InstallMethod::CargoGit.upgrade_command(),
-            Some("cargo install --git https://github.com/octos-org/octos-tui octos-tui --force")
+            Some("cargo install --git https://github.com/octos-org/octoscode octoscode --force")
         );
         assert!(
             InstallMethod::Unknown
                 .upgrade_command()
                 .unwrap()
-                .contains("octos-tui-installer.sh")
+                .contains("octoscode-installer.sh")
         );
     }
 
@@ -528,14 +528,14 @@ mod tests {
         // npm → the `next` dist-tag (never `latest`).
         assert_eq!(
             InstallMethod::Npm.prerelease_upgrade_command().as_deref(),
-            Some("npm install -g @octos-org/octos-tui@next")
+            Some("npm install -g @octos-org/octoscode@next")
         );
         // Homebrew → the separate dev formula (never the stable formula).
         assert_eq!(
             InstallMethod::Homebrew
                 .prerelease_upgrade_command()
                 .as_deref(),
-            Some("brew install octos-org/octos-tui/octos-tui-dev")
+            Some("brew install octos-org/octoscode/octoscode-dev")
         );
         // cargo-dist self-updates in place; the rest have no rc-specific channel.
         assert!(
@@ -563,7 +563,7 @@ mod tests {
     #[test]
     fn npm_prerelease_uses_next_tag_not_stable_latest() {
         // The prerelease channel must pin `@next` and must NOT be the stable
-        // `npm update -g @octos-org/octos-tui` (which follows `latest`).
+        // `npm update -g @octos-org/octoscode` (which follows `latest`).
         let pre = InstallMethod::Npm.prerelease_upgrade_command().unwrap();
         assert!(
             pre.contains("@next"),
@@ -574,14 +574,14 @@ mod tests {
 
     #[test]
     fn brew_prerelease_targets_dev_formula_not_stable() {
-        // The prerelease channel installs `octos-tui-dev`, never the stable
-        // `octos-tui` formula that a plain `brew upgrade` follows.
+        // The prerelease channel installs `octoscode-dev`, never the stable
+        // `octoscode` formula that a plain `brew upgrade` follows.
         let pre = InstallMethod::Homebrew
             .prerelease_upgrade_command()
             .unwrap();
         assert!(pre.starts_with("brew install"));
         assert!(
-            pre.ends_with("octos-tui-dev"),
+            pre.ends_with("octoscode-dev"),
             "must target the dev formula: {pre}"
         );
         assert_ne!(pre, InstallMethod::Homebrew.upgrade_command().unwrap());
@@ -592,11 +592,11 @@ mod tests {
         // Guard: adding the prerelease channel must not perturb the stable ones.
         assert_eq!(
             InstallMethod::Npm.upgrade_command(),
-            Some("npm update -g @octos-org/octos-tui")
+            Some("npm update -g @octos-org/octoscode")
         );
         assert_eq!(
             InstallMethod::Homebrew.upgrade_command(),
-            Some("brew update && brew upgrade octos-org/octos-tui/octos-tui")
+            Some("brew update && brew upgrade octos-org/octoscode/octoscode")
         );
     }
 
@@ -620,11 +620,11 @@ mod tests {
         // trap that a naive `starts_with` on strings would hit).
         assert!(!is_ancestor(
             Path::new("/opt/home"),
-            Path::new("/opt/homebrew/bin/octos-tui")
+            Path::new("/opt/homebrew/bin/octoscode")
         ));
         assert!(is_ancestor(
             Path::new("/opt/homebrew"),
-            Path::new("/opt/homebrew/bin/octos-tui")
+            Path::new("/opt/homebrew/bin/octoscode")
         ));
     }
 
@@ -634,7 +634,7 @@ mod tests {
     fn parse_cargo_source_is_git_returns_false_for_registry_source() {
         let json = r#"{
             "installs": {
-                "octos-tui 0.1.1 (registry+https://github.com-crates-io-sparse+https://github.com/rust-lang/crates.io-index/)": {}
+                "octoscode 0.1.1 (registry+https://github.com-crates-io-sparse+https://github.com/rust-lang/crates.io-index/)": {}
             }
         }"#;
         assert_eq!(parse_cargo_source_is_git(json), Some(false));
@@ -644,7 +644,7 @@ mod tests {
     fn parse_cargo_source_is_git_returns_true_for_git_source() {
         let json = r#"{
             "installs": {
-                "octos-tui 0.1.2 (git+https://github.com/octos-org/octos-tui#abc123)": {}
+                "octoscode 0.1.2 (git+https://github.com/octos-org/octoscode#abc123)": {}
             }
         }"#;
         assert_eq!(parse_cargo_source_is_git(json), Some(true));
@@ -652,7 +652,7 @@ mod tests {
 
     #[test]
     fn parse_cargo_source_is_git_returns_none_when_crate_absent() {
-        // Another crate is present but not octos-tui.
+        // Another crate is present but not octoscode.
         let json = r#"{"installs": {"other-crate 1.0.0 (registry+https://…)": {}}}"#;
         assert_eq!(parse_cargo_source_is_git(json), None);
     }
@@ -706,7 +706,7 @@ mod tests {
     #[test]
     fn detect_with_no_receipt_npm_path_returns_npm() {
         let mut i =
-            input("/home/u/.nvm/versions/node/v20/lib/node_modules/octos-tui/bin/octos-tui");
+            input("/home/u/.nvm/versions/node/v20/lib/node_modules/octoscode/bin/octoscode");
         i.npm_global_roots = vec![PathBuf::from(
             "/home/u/.nvm/versions/node/v20/lib/node_modules",
         )];
@@ -715,14 +715,14 @@ mod tests {
 
     #[test]
     fn detect_with_no_receipt_homebrew_path_returns_homebrew() {
-        let mut i = input("/opt/homebrew/bin/octos-tui");
+        let mut i = input("/opt/homebrew/bin/octoscode");
         i.brew_prefixes = vec![PathBuf::from("/opt/homebrew")];
         assert_eq!(detect_with(false, &i), InstallMethod::Homebrew);
     }
 
     #[test]
     fn detect_with_no_receipt_cargo_registry_returns_cargo_registry() {
-        let mut i = input("/home/u/.cargo/bin/octos-tui");
+        let mut i = input("/home/u/.cargo/bin/octoscode");
         i.cargo_bin = Some(PathBuf::from("/home/u/.cargo/bin"));
         i.cargo_source_is_git = Some(false);
         assert_eq!(detect_with(false, &i), InstallMethod::CargoRegistry);
@@ -730,7 +730,7 @@ mod tests {
 
     #[test]
     fn detect_with_no_receipt_cargo_git_returns_cargo_git() {
-        let mut i = input("/home/u/.cargo/bin/octos-tui");
+        let mut i = input("/home/u/.cargo/bin/octoscode");
         i.cargo_bin = Some(PathBuf::from("/home/u/.cargo/bin"));
         i.cargo_source_is_git = Some(true);
         assert_eq!(detect_with(false, &i), InstallMethod::CargoGit);

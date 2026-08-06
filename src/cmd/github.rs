@@ -1,7 +1,7 @@
 //! Minimal GitHub Releases client for `update --check` and `doctor`.
 //!
 //! A plain blocking `reqwest` GET against the public Releases API — no auth is
-//! required for public repos, but `OCTOS_TUI_GITHUB_TOKEN` is honored to dodge
+//! required for public repos, but `OCTOSCODE_GITHUB_TOKEN` is honored to dodge
 //! the unauthenticated rate limit (design §A.2 / Risks).
 
 use std::time::Duration;
@@ -10,13 +10,13 @@ use eyre::{Result, WrapErr, eyre};
 use serde::Deserialize;
 
 /// `owner/name` slug for the released TUI binary.
-pub const GITHUB_REPO: &str = "octos-org/octos-tui";
+pub const GITHUB_REPO: &str = "octos-org/octoscode";
 
 const RELEASES_LATEST_URL: &str =
-    "https://api.github.com/repos/octos-org/octos-tui/releases/latest";
-const RELEASES_URL: &str = "https://api.github.com/repos/octos-org/octos-tui/releases";
+    "https://api.github.com/repos/octos-org/octoscode/releases/latest";
+const RELEASES_URL: &str = "https://api.github.com/repos/octos-org/octoscode/releases";
 const API_BASE: &str = "https://api.github.com";
-const USER_AGENT: &str = concat!("octos-tui/", env!("CARGO_PKG_VERSION"));
+const USER_AGENT: &str = concat!("octoscode/", env!("CARGO_PKG_VERSION"));
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The release info `update`/`doctor` care about.
@@ -45,10 +45,10 @@ fn client() -> Result<reqwest::blocking::Client> {
         .wrap_err("failed to build HTTP client")
 }
 
-/// The GitHub token from `OCTOS_TUI_GITHUB_TOKEN`, if set and non-blank.
+/// The GitHub token from `OCTOSCODE_GITHUB_TOKEN`, if set and non-blank.
 /// Shared with the self-update path so axoupdater honors the same token.
 pub(crate) fn token() -> Option<String> {
-    std::env::var("OCTOS_TUI_GITHUB_TOKEN")
+    std::env::var("OCTOSCODE_GITHUB_TOKEN")
         .ok()
         .filter(|t| !t.trim().is_empty())
 }
@@ -91,7 +91,7 @@ pub fn latest_release(allow_prerelease: bool) -> Result<Option<LatestRelease>> {
     }
     if !status.is_success() {
         return Err(eyre!(
-            "GitHub returned {status} for the latest octos-tui release"
+            "GitHub returned {status} for the latest octoscode release"
         ));
     }
     let payload: ReleasePayload = resp

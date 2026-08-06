@@ -1,11 +1,11 @@
 spec: project
-name: octos-tui
+name: octoscode
 tags: [tui, appui-client]
 ---
 
 ## 意图
 
-octos-tui 是 octos 后端的纯终端客户端：通过 JSON-RPC 的 Octos UI Protocol 与
+octoscode 是 octos 后端的纯终端客户端：通过 JSON-RPC 的 Octos UI Protocol 与
 `octos serve`（stdio/WebSocket）交互，自身不跑 agent、不执行 tool、不拥有
 provider/sandbox/permission 真相。本 project spec 编码全仓不变量，所有 task
 spec 以 `inherits: project` 继承。

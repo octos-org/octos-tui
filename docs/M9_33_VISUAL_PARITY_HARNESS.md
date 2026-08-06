@@ -5,7 +5,7 @@ Status: accepted for the next parent `octos` tmux harness update.
 ## Scope
 
 The executable harness lives in the parent `octos` repository because it starts
-both `octos serve` and standalone `octos-tui`. This repo owns the UI assertions
+both `octos serve` and standalone `octoscode`. This repo owns the UI assertions
 that harness must check.
 
 ## Required State Matrix
@@ -26,8 +26,8 @@ The tmux harness must retain captures for each state:
 
 Each parity run must keep:
 
-- raw tmux capture for `octos-tui`
-- cleaned/redacted tmux capture for `octos-tui`
+- raw tmux capture for `octoscode`
+- cleaned/redacted tmux capture for `octoscode`
 - Codex comparison capture when enabled
 - server log
 - worktree diff
@@ -37,11 +37,11 @@ Each parity run must keep:
 
 ## Live Watch Contract
 
-When `OCTOS_TMUX_KEEP=1` or `OCTOS_TUI_UX_KEEP_SESSIONS=1` is set, the runner
+When `OCTOS_TMUX_KEEP=1` or `OCTOSCODE_UX_KEEP_SESSIONS=1` is set, the runner
 must print attach commands for both sessions and leave them alive:
 
 ```bash
-tmux attach -r -t <octos-tui-client-session>
+tmux attach -r -t <octoscode-client-session>
 tmux attach -r -t <codex-client-session>
 ```
 

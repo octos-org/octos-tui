@@ -7310,7 +7310,7 @@ fn status_line_items(app: MenuAppSnapshot<'_>) -> [(&'static str, String, bool);
 
 fn title_items(app: MenuAppSnapshot<'_>) -> [(&'static str, String, bool); 7] {
     [
-        ("app", "octos-tui".into(), true),
+        ("app", "octoscode".into(), true),
         (
             "session",
             app.selected_session_title.unwrap_or("no session").into(),

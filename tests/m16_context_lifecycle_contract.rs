@@ -1,5 +1,5 @@
 use octos_core::SessionKey;
-use octos_tui::model::{
+use octoscode::model::{
     APPUI_FEATURE_CONTEXT_LIFECYCLE_V1, APPUI_METHOD_CONTEXT_COMPACTION_COMPLETED,
     APPUI_METHOD_CONTEXT_NORMALIZATION_REPORTED, ContextCompactionSummary, ContextLifecycleState,
     ContextNormalizationSummary, SessionContextLifecycle,

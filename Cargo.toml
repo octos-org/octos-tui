@@ -1,15 +1,15 @@
 [package]
-name = "octos-tui"
+name = "octoscode"
 version = "0.2.3-rc.1"
 edition = "2024"
 rust-version = "1.85.0"
 license = "Apache-2.0"
-repository = "https://github.com/octos-org/octos-tui"
-homepage = "https://github.com/octos-org/octos-tui"
+repository = "https://github.com/octos-org/octoscode"
+homepage = "https://github.com/octos-org/octoscode"
 description = "Terminal UI client for the Octos UI Protocol"
 
 [[bin]]
-name = "octos-tui"
+name = "octoscode"
 path = "src/main.rs"
 
 # octos-core is the shared protocol crate, owned by the `octos` repo. We depend

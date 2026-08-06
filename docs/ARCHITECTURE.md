@@ -1,8 +1,8 @@
-# octos-tui Architecture
+# octoscode Architecture
 
 ## Scope
 
-`octos-tui` is a standalone terminal client for the Octos UI Protocol.
+`octoscode` is a standalone terminal client for the Octos UI Protocol.
 In protocol mode it does not run the Octos agent, execute tools, approve
 commands, maintain the durable ledger, or own provider/model configuration.
 Those responsibilities belong to the `octos serve` process.
@@ -31,7 +31,7 @@ The server owns:
 User keyboard
   |
   v
-octos-tui
+octoscode
   src/event_loop.rs       terminal draw/read/send loop
   src/store.rs            AppUI reducer and follow-up command builder
   src/app.rs              ratatui panes, markdown, tasks, diffs, approvals
@@ -53,10 +53,10 @@ Octos runtime
   |
   | UiNotification / UiProgressEvent / RPC results
   v
-octos-tui Store -> AppState -> ratatui render
+octoscode Store -> AppState -> ratatui render
 ```
 
-`octos-tui` and `octos-app` should both depend on the AppUI contract, not on
+`octoscode` and `octos-app` should both depend on the AppUI contract, not on
 M9 or future M10 implementation details. As long as the AppUI API remains
 compatible, client behavior should survive server-internal milestone changes.
 
@@ -86,7 +86,7 @@ The older endpoint:
 ```
 
 is the legacy web chat/gateway WebSocket. It is not the AppUI contract used by
-`octos-tui`.
+`octoscode`.
 
 ## Shared API Types
 
@@ -468,12 +468,12 @@ added without a row here.
 | File | Lines | Responsibility |
 |---|---:|---|
 | `src/cli.rs` | 1053 | `--config` JSON launch defaults plus CLI overrides. Must not own provider/model settings; those stay in Octos server config. |
-| `src/cmd/config.rs` | 152 | `octos-tui config`: read-only inspection of the client's startup config |
-| `src/cmd/doctor.rs` | 2460 | `octos-tui doctor` — flutter-doctor-style diagnostics (design §B). |
+| `src/cmd/config.rs` | 152 | `octoscode config`: read-only inspection of the client's startup config |
+| `src/cmd/doctor.rs` | 2460 | `octoscode doctor` — flutter-doctor-style diagnostics (design §B). |
 | `src/cmd/github.rs` | 155 | Minimal GitHub Releases client for `update --check` and `doctor`. |
-| `src/cmd/install_method.rs` | 746 | Install-method detection for `octos-tui update`/`doctor` (design §A.3). |
-| `src/cmd/mod.rs` | 273 | `octos-tui` subcommands: `update` and `doctor` (design doc). |
-| `src/cmd/update.rs` | 606 | `octos-tui update` — install-method-aware updater (design §A). |
+| `src/cmd/install_method.rs` | 746 | Install-method detection for `octoscode update`/`doctor` (design §A.3). |
+| `src/cmd/mod.rs` | 273 | `octoscode` subcommands: `update` and `doctor` (design doc). |
+| `src/cmd/update.rs` | 606 | `octoscode update` — install-method-aware updater (design §A). |
 | `src/lib.rs` | 317 | Crate root — module declarations and the shared public surface. |
 | `src/main.rs` | 53 | Binary entry point: subcommand dispatch, then `event_loop::run`. |
 
@@ -490,7 +490,7 @@ added without a row here.
 
 | File | Lines | Responsibility |
 |---|---:|---|
-| `src/backend_ensure.rs` | 1140 | Auto-provision the `octos` server backend so a fresh octos-tui install |
+| `src/backend_ensure.rs` | 1140 | Auto-provision the `octos` server backend so a fresh octoscode install |
 | `src/profiles.rs` | 544 | Phase 3 startup profile discovery. |
 | `src/transport.rs` | 10721 | `AppUiBackend`, the mock and protocol backends, WebSocket/stdio framing, auth, reconnect status and in-memory cursors. |
 
@@ -507,7 +507,7 @@ added without a row here.
 | `src/highlight.rs` | 172 | Fenced-code-block syntax highlighting for the transcript renderer |
 | `src/insert_history.rs` | 1603 | Insert finalized history lines into the terminal's **normal scrollback**, |
 | `src/sanitize.rs` | 160 | Terminal control-sequence sanitisation for server-supplied text. |
-| `src/terminal_probe.rs` | 243 | Terminal detection and color adaptation for octos-tui. |
+| `src/terminal_probe.rs` | 243 | Terminal detection and color adaptation for octoscode. |
 | `src/theme.rs` | 204 | Terminal-aware palettes and theme-specific colors. |
 | `src/tui_terminal.rs` | 1171 | Inline-viewport terminal — ported and trimmed from codex-rs `tui/src/custom_terminal.rs`. |
 | `src/viewport.rs` | 576 | Inline-viewport driver: owns the scrollback-flush bookkeeping that turns |
@@ -545,7 +545,7 @@ one-off slash handlers. The milestone plan lives in
 The intended boundary is:
 
 - generic command registry, slash popup, selection views, and menu stack live in
-  `octos-tui`
+  `octoscode`
 - local menus such as `/theme`, `/statusline`, `/title`, and `/keymap` remain
   local TUI concerns
 - server-backed menus such as `/model`, `/status`, `/permissions`, and `/mcp`
@@ -555,7 +555,7 @@ The intended boundary is:
 
 ## Protocol Startup Flow
 
-1. `octos-tui` parses CLI launch preferences.
+1. `octoscode` parses CLI launch preferences.
 2. `build_backend()` creates either `MockAppUiBackend` or
    `ProtocolAppUiBackend`.
 3. In protocol mode, `bootstrap()` connects to `/api/ui-protocol/ws`.
@@ -678,7 +678,7 @@ The important product difference is where the runtime lives:
 
 | Area | Codex-style local CLI | Octos AppUI architecture |
 |---|---|---|
-| UI | Local CLI/TUI process. | `octos-tui` or `octos-app`. |
+| UI | Local CLI/TUI process. | `octoscode` or `octos-app`. |
 | Runtime owner | Mostly the local CLI process, with model service calls. | `octos serve`. |
 | Tool execution | Local CLI sandbox/tool runner. | Server-side Octos runtime/tool system. |
 | Approval policy | Local CLI approval flow. | Server-owned approval requests plus client rendering/response. |
@@ -691,9 +691,9 @@ same AppUI API to the Octos server.
 
 ## Architectural Invariants
 
-- `octos-tui` must not call Octos runtime internals directly.
-- `octos-tui` must not rely on M9-specific server internals outside AppUI.
-- `octos-tui` must treat the server as authoritative for tasks, approvals,
+- `octoscode` must not call Octos runtime internals directly.
+- `octoscode` must not rely on M9-specific server internals outside AppUI.
+- `octoscode` must treat the server as authoritative for tasks, approvals,
   diffs, tool results, cwd policy, sandbox policy, and replay.
 - The server must not require TUI-specific behavior for protocol correctness.
 - New client-visible runtime features should land in `octos-core` AppUI/UI

@@ -1,4 +1,4 @@
-//! `octos-tui update` — install-method-aware updater (design §A).
+//! `octoscode update` — install-method-aware updater (design §A).
 //!
 //! Behavior by detected [`InstallMethod`]:
 //! - **cargo-dist installer** (receipt present): self-update in place via
@@ -12,16 +12,16 @@
 //! - **cargo-dist installer**: self-updates in place to the latest prerelease
 //!   (axoupdater `LatestMaybePrerelease`).
 //! - **npm**: prereleases publish under the `next` dist-tag, so
-//!   `@octos-org/octos-tui@next` is the latest rc while a bare install / `@latest`
-//!   stay stable. `--prerelease` prints `npm install -g @octos-org/octos-tui@next`.
-//! - **Homebrew**: prereleases are a SEPARATE `octos-tui-dev` formula in this
-//!   repo's tap; stable `octos-tui` is untouched. `--prerelease` prints
-//!   `brew install octos-org/octos-tui/octos-tui-dev`.
+//!   `@octos-org/octoscode@next` is the latest rc while a bare install / `@latest`
+//!   stay stable. `--prerelease` prints `npm install -g @octos-org/octoscode@next`.
+//! - **Homebrew**: prereleases are a SEPARATE `octoscode-dev` formula in this
+//!   repo's tap; stable `octoscode` is untouched. `--prerelease` prints
+//!   `brew install octos-org/octoscode/octoscode-dev`.
 //! - **cargo install / unknown**: no rc-specific channel — `--prerelease` points
 //!   at the universal npm `@next` channel (or the shell installer).
 //!
 //! `--check` is install-method-agnostic: it queries the latest GitHub release
-//! for `octos-org/octos-tui` (prereleases included with `--prerelease`), compares
+//! for `octos-org/octoscode` (prereleases included with `--prerelease`), compares
 //! to the compiled-in `CARGO_PKG_VERSION`, prints the result — with the
 //! channel-appropriate upgrade command — and exits `10` (update available) or
 //! `0` (current).
@@ -40,12 +40,12 @@ use super::github::GITHUB_REPO;
 use super::install_method::{InstallMethod, detect};
 
 /// Universal prerelease-install fallback. npm's `next` dist-tag works no matter
-/// how octos-tui was originally installed, so it is what we advertise for
+/// how octoscode was originally installed, so it is what we advertise for
 /// methods with no dedicated prerelease channel of their own (cargo install,
 /// unknown). See [`advertised_command`].
-const PRERELEASE_NPM_FALLBACK: &str = "npm install -g @octos-org/octos-tui@next";
+const PRERELEASE_NPM_FALLBACK: &str = "npm install -g @octos-org/octoscode@next";
 
-/// Parsed `octos-tui update` flags.
+/// Parsed `octoscode update` flags.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UpdateArgs {
     /// Only report whether an update is available; never mutate.
@@ -86,7 +86,7 @@ impl UpdateOutcome {
     }
 }
 
-/// Entry point for `octos-tui update`.
+/// Entry point for `octoscode update`.
 pub fn run(args: UpdateArgs) -> Result<UpdateOutcome> {
     let method = detect();
     let current = current_version()?;
@@ -111,7 +111,7 @@ fn run_check(
     current: &Version,
 ) -> Result<UpdateOutcome> {
     let Some(latest) = github::latest_release(args.prerelease)
-        .wrap_err("failed to query the latest octos-tui release from GitHub")?
+        .wrap_err("failed to query the latest octoscode release from GitHub")?
     else {
         // No releases published yet — nothing to compare against; not an error.
         if args.json {
@@ -125,7 +125,7 @@ fn run_check(
             });
             println!("{}", serde_json::to_string_pretty(&payload)?);
         } else {
-            println!("octos-tui {current} — no published releases found yet.");
+            println!("octoscode {current} — no published releases found yet.");
         }
         return Ok(UpdateOutcome::Success);
     };
@@ -150,7 +150,7 @@ fn run_check(
         );
         print_method_hint(method, args.prerelease);
     } else {
-        println!("octos-tui {current} is up to date (latest is {latest_version}).");
+        println!("octoscode {current} is up to date (latest is {latest_version}).");
     }
 
     Ok(if newer {
@@ -199,10 +199,10 @@ fn print_method_hint(method: &InstallMethod, prerelease: bool) {
         Some(cmd) => println!("  To upgrade ({}):\n    {cmd}", method.label()),
         None if prerelease => {
             println!(
-                "  Run `octos-tui update --prerelease` to self-update to the latest prerelease."
+                "  Run `octoscode update --prerelease` to self-update to the latest prerelease."
             )
         }
-        None => println!("  Run `octos-tui update` to upgrade in place."),
+        None => println!("  Run `octoscode update` to upgrade in place."),
     }
 }
 
@@ -218,7 +218,7 @@ fn defer_to_package_manager(method: &InstallMethod, args: &UpdateArgs) {
             "install_method": method.id(),
             "self_update": false,
             "upgrade_command": cmd,
-            "message": "octos-tui was not installed by the self-updating installer; \
+            "message": "octoscode was not installed by the self-updating installer; \
         run the command above with your package manager",
         });
         if let Ok(text) = serde_json::to_string_pretty(&payload) {
@@ -228,19 +228,19 @@ fn defer_to_package_manager(method: &InstallMethod, args: &UpdateArgs) {
     }
 
     println!(
-        "octos-tui was installed via {}. Self-update is disabled for this build.",
+        "octoscode was installed via {}. Self-update is disabled for this build.",
         method.label()
     );
     if matches!(method, InstallMethod::CargoRegistry) {
         println!("To upgrade, run:\n    {cmd}");
-        println!("(tip: `cargo install cargo-update` then `cargo install-update octos-tui`)");
+        println!("(tip: `cargo install cargo-update` then `cargo install-update octoscode`)");
     } else {
         println!("To upgrade, run:\n    {cmd}");
     }
 }
 
 /// Prerelease variant of [`defer_to_package_manager`]: point the user at the
-/// method's prerelease channel — npm's `@next` dist-tag or the `octos-tui-dev`
+/// method's prerelease channel — npm's `@next` dist-tag or the `octoscode-dev`
 /// brew formula — or, for methods without one, at the universal npm `@next`
 /// fallback plus the shell installer. The JSON `upgrade_command` always reflects
 /// the prerelease channel so scripts can act on it.
@@ -255,7 +255,7 @@ fn defer_to_prerelease_channel(method: &InstallMethod, args: &UpdateArgs) {
             "prerelease": true,
             "upgrade_command": cmd,
             "message": "prerelease channel — install from npm @next \
-        (@octos-org/octos-tui@next) or the octos-tui-dev Homebrew formula",
+        (@octos-org/octoscode@next) or the octoscode-dev Homebrew formula",
         });
         if let Ok(text) = serde_json::to_string_pretty(&payload) {
             println!("{text}");
@@ -265,7 +265,7 @@ fn defer_to_prerelease_channel(method: &InstallMethod, args: &UpdateArgs) {
 
     match method.prerelease_upgrade_command() {
         Some(channel_cmd) => println!(
-            "octos-tui was installed via {}. To track the prerelease channel, run:\n    {channel_cmd}",
+            "octoscode was installed via {}. To track the prerelease channel, run:\n    {channel_cmd}",
             method.label()
         ),
         None => println!(
@@ -281,12 +281,12 @@ installer or npm @next:\n    {PRERELEASE_NPM_FALLBACK}",
 fn self_update(args: &UpdateArgs, current: &Version) -> Result<UpdateOutcome> {
     use axoupdater::{AxoUpdater, UpdateRequest};
 
-    let mut updater = AxoUpdater::new_for("octos-tui");
+    let mut updater = AxoUpdater::new_for("octoscode");
     updater
         .load_receipt()
         .wrap_err("cargo-dist install receipt not found; cannot self-update")?;
 
-    // Honor OCTOS_TUI_GITHUB_TOKEN so rate-limited / private-repo machines don't
+    // Honor OCTOSCODE_GITHUB_TOKEN so rate-limited / private-repo machines don't
     // fail. axoupdater 0.6.9 exposes the public `set_github_token`, so feed the
     // same token the GitHub client uses (no need to mutate process env).
     if let Some(tok) = super::github::token() {
@@ -322,10 +322,10 @@ fn self_update(args: &UpdateArgs, current: &Version) -> Result<UpdateOutcome> {
             .is_update_needed_sync()
             .wrap_err("failed to check whether an update is available")?;
         if !needed && !args.force {
-            println!("octos-tui {current} is already up to date.");
+            println!("octoscode {current} is already up to date.");
             return Ok(UpdateOutcome::Success);
         }
-        println!("About to self-update octos-tui from {current} (source: {GITHUB_REPO}).");
+        println!("About to self-update octoscode from {current} (source: {GITHUB_REPO}).");
         if !confirm("Proceed? [y/N] ")? {
             println!("Aborted.");
             return Ok(UpdateOutcome::Success);
@@ -345,7 +345,7 @@ fn self_update(args: &UpdateArgs, current: &Version) -> Result<UpdateOutcome> {
                 print_self_update_json(true, &old_version, Some(&result.new_version.to_string()));
             } else {
                 println!(
-                    "Updated octos-tui {} -> {} (tag {}).",
+                    "Updated octoscode {} -> {} (tag {}).",
                     old_version, result.new_version, result.new_version_tag,
                 );
             }
@@ -358,7 +358,7 @@ fn self_update(args: &UpdateArgs, current: &Version) -> Result<UpdateOutcome> {
             if args.json {
                 print_self_update_json(false, &current.to_string(), None);
             } else {
-                println!("octos-tui {current} is already up to date.");
+                println!("octoscode {current} is already up to date.");
             }
             Ok(UpdateOutcome::Success)
         }
@@ -386,7 +386,7 @@ fn print_self_update_json(updated: bool, old_version: &str, new_version: Option<
 #[cfg(not(feature = "update"))]
 fn self_update(_args: &UpdateArgs, current: &Version) -> Result<UpdateOutcome> {
     println!(
-        "octos-tui {current} was installed by the cargo-dist installer, but this build was \
+        "octoscode {current} was installed by the cargo-dist installer, but this build was \
 compiled without in-place self-update (`update` feature off)."
     );
     if let Some(cmd) = InstallMethod::Unknown.upgrade_command() {
@@ -406,11 +406,11 @@ compiled without in-place self-update (`update` feature off)."
 fn codesign_after_swap(install_prefix: &std::path::Path, quiet: bool) {
     #[cfg(target_os = "macos")]
     {
-        let binary = install_prefix.join("bin").join("octos-tui");
+        let binary = install_prefix.join("bin").join("octoscode");
         let target = if binary.exists() {
             binary
         } else {
-            install_prefix.join("octos-tui")
+            install_prefix.join("octoscode")
         };
         if !target.exists() {
             return;
@@ -523,15 +523,15 @@ mod tests {
         // Guards the exact strings the update advisor prints.
         assert_eq!(
             InstallMethod::Homebrew.upgrade_command().unwrap(),
-            "brew update && brew upgrade octos-org/octos-tui/octos-tui"
+            "brew update && brew upgrade octos-org/octoscode/octoscode"
         );
         assert_eq!(
             InstallMethod::Npm.upgrade_command().unwrap(),
-            "npm update -g @octos-org/octos-tui"
+            "npm update -g @octos-org/octoscode"
         );
         assert_eq!(
             InstallMethod::CargoRegistry.upgrade_command().unwrap(),
-            "cargo install octos-tui --force"
+            "cargo install octoscode --force"
         );
     }
 
@@ -540,20 +540,20 @@ mod tests {
         // npm: stable follows `latest`; prerelease pins `@next`.
         assert_eq!(
             advertised_command(&InstallMethod::Npm, false).as_deref(),
-            Some("npm update -g @octos-org/octos-tui")
+            Some("npm update -g @octos-org/octoscode")
         );
         assert_eq!(
             advertised_command(&InstallMethod::Npm, true).as_deref(),
-            Some("npm install -g @octos-org/octos-tui@next")
+            Some("npm install -g @octos-org/octoscode@next")
         );
         // Homebrew: stable formula vs. the separate dev formula.
         assert_eq!(
             advertised_command(&InstallMethod::Homebrew, false).as_deref(),
-            Some("brew update && brew upgrade octos-org/octos-tui/octos-tui")
+            Some("brew update && brew upgrade octos-org/octoscode/octoscode")
         );
         assert_eq!(
             advertised_command(&InstallMethod::Homebrew, true).as_deref(),
-            Some("brew install octos-org/octos-tui/octos-tui-dev")
+            Some("brew install octos-org/octoscode/octoscode-dev")
         );
     }
 

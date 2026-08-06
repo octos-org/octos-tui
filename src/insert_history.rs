@@ -561,7 +561,7 @@ mod tests {
     /// A `Backend + Write` that records every byte emitted, so tests can assert on
     /// the exact escape-sequence stream `insert_history_lines` writes into the
     /// terminal's real scrollback (codex's tests use a VT100 backend for this; the
-    /// octos-tui crate has no vt100 dep, so we inspect the raw bytes instead).
+    /// octoscode crate has no vt100 dep, so we inspect the raw bytes instead).
     struct RecordingBackend {
         buf: Vec<u8>,
         size: Size,

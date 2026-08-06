@@ -1,5 +1,5 @@
 {
-  "schema": "octos-tui.appui-ux-fixture.v1",
+  "schema": "octoscode.appui-ux-fixture.v1",
   "name": "issue-7-coding-session-short",
   "description": "Deterministic CI-safe AppUI UX parity fixture for WebSocket and future stdio transports.",
   "mode": "ci-short",
@@ -22,9 +22,9 @@
           "id": "ws-1",
           "method": "session/open",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "profile_id": "coding",
-            "cwd": "/tmp/octos-tui-fixture"
+            "cwd": "/tmp/octoscode-fixture"
           }
         }
       },
@@ -37,9 +37,9 @@
           "id": "stdio-1",
           "method": "session/open",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "profile_id": "coding",
-            "cwd": "/tmp/octos-tui-fixture"
+            "cwd": "/tmp/octoscode-fixture"
           }
         }
       }
@@ -56,9 +56,9 @@
           "jsonrpc": "2.0",
           "method": "session/open",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "active_profile_id": "coding",
-            "workspace_root": "/tmp/octos-tui-fixture",
+            "workspace_root": "/tmp/octoscode-fixture",
             "cursor": {
               "stream": "ui",
               "seq": 1
@@ -74,9 +74,9 @@
           "jsonrpc": "2.0",
           "method": "session/open",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "active_profile_id": "coding",
-            "workspace_root": "/tmp/octos-tui-fixture",
+            "workspace_root": "/tmp/octoscode-fixture",
             "cursor": {
               "stream": "ui",
               "seq": 1
@@ -98,7 +98,7 @@
           "id": "ws-2",
           "method": "turn/start",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000001",
             "input": [
               {
@@ -118,7 +118,7 @@
           "id": "stdio-2",
           "method": "turn/start",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000001",
             "input": [
               {
@@ -142,7 +142,7 @@
           "jsonrpc": "2.0",
           "method": "turn/started",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000001",
             "timestamp": "2026-05-02T00:00:01Z",
             "runtime_policy_stamp": {
@@ -169,7 +169,7 @@
           "jsonrpc": "2.0",
           "method": "turn/started",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000001",
             "timestamp": "2026-05-02T00:00:01Z",
             "runtime_policy_stamp": {
@@ -204,7 +204,7 @@
           "jsonrpc": "2.0",
           "method": "message/delta",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000001",
             "text": "Plan\n- [ ] Normalize WebSocket frames\n- [ ] Compare future stdio frames\n\n| Surface | Expected | Notes |\n|---|---|---|\n| Transcript | user before assistant | deterministic |\n| Work pane | sticky plan/status | metadata-backed |"
           }
@@ -218,7 +218,7 @@
           "jsonrpc": "2.0",
           "method": "message/delta",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000001",
             "text": "Plan\n- [ ] Normalize WebSocket frames\n- [ ] Compare future stdio frames\n\n| Surface | Expected | Notes |\n|---|---|---|\n| Transcript | user before assistant | deterministic |\n| Work pane | sticky plan/status | metadata-backed |"
           }
@@ -240,7 +240,7 @@
           "jsonrpc": "2.0",
           "method": "progress/updated",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000001",
             "metadata": {
               "kind": "status",
@@ -257,7 +257,7 @@
           "jsonrpc": "2.0",
           "method": "progress/updated",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000001",
             "metadata": {
               "kind": "status",
@@ -279,7 +279,7 @@
           "jsonrpc": "2.0",
           "method": "task/updated",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "task_id": "00000000-0000-4000-8000-000000000005",
             "title": "Build/test fixture",
             "state": "pending",
@@ -295,7 +295,7 @@
           "jsonrpc": "2.0",
           "method": "task/updated",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "task_id": "00000000-0000-4000-8000-000000000005",
             "title": "Build/test fixture",
             "state": "pending",
@@ -316,7 +316,7 @@
           "jsonrpc": "2.0",
           "method": "task/updated",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "task_id": "00000000-0000-4000-8000-000000000005",
             "title": "Build/test fixture",
             "state": "running",
@@ -332,7 +332,7 @@
           "jsonrpc": "2.0",
           "method": "task/updated",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "task_id": "00000000-0000-4000-8000-000000000005",
             "title": "Build/test fixture",
             "state": "running",
@@ -356,7 +356,7 @@
           "jsonrpc": "2.0",
           "method": "tool/started",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000001",
             "tool_call_id": "shell-1",
             "tool_name": "shell",
@@ -374,7 +374,7 @@
           "jsonrpc": "2.0",
           "method": "tool/started",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000001",
             "tool_call_id": "shell-1",
             "tool_name": "shell",
@@ -397,7 +397,7 @@
           "jsonrpc": "2.0",
           "method": "tool/progress",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000001",
             "tool_call_id": "shell-1",
             "message": "Running cargo test",
@@ -413,7 +413,7 @@
           "jsonrpc": "2.0",
           "method": "tool/progress",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000001",
             "tool_call_id": "shell-1",
             "message": "Running cargo test",
@@ -438,7 +438,7 @@
           "jsonrpc": "2.0",
           "method": "tool/completed",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000001",
             "tool_call_id": "shell-1",
             "tool_name": "shell",
@@ -456,7 +456,7 @@
           "jsonrpc": "2.0",
           "method": "tool/completed",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000001",
             "tool_call_id": "shell-1",
             "tool_name": "shell",
@@ -482,7 +482,7 @@
           "jsonrpc": "2.0",
           "method": "task/output/delta",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "task_id": "00000000-0000-4000-8000-000000000005",
             "cursor": {
               "offset": 180
@@ -499,7 +499,7 @@
           "jsonrpc": "2.0",
           "method": "task/output/delta",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "task_id": "00000000-0000-4000-8000-000000000005",
             "cursor": {
               "offset": 180
@@ -522,7 +522,7 @@
           "id": "ws-3",
           "method": "task/output/read",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "task_id": "00000000-0000-4000-8000-000000000005",
             "cursor": {
               "offset": 0
@@ -540,7 +540,7 @@
           "id": "stdio-3",
           "method": "task/output/read",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "task_id": "00000000-0000-4000-8000-000000000005",
             "cursor": {
               "offset": 0
@@ -562,7 +562,7 @@
           "jsonrpc": "2.0",
           "id": "ws-3",
           "result": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "task_id": "00000000-0000-4000-8000-000000000005",
             "source": "runtime_projection",
             "cursor": {
@@ -593,7 +593,7 @@
           "jsonrpc": "2.0",
           "id": "stdio-3",
           "result": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "task_id": "00000000-0000-4000-8000-000000000005",
             "source": "runtime_projection",
             "cursor": {
@@ -632,7 +632,7 @@
           "jsonrpc": "2.0",
           "method": "progress/updated",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000001",
             "metadata": {
               "kind": "file_mutation",
@@ -656,7 +656,7 @@
           "jsonrpc": "2.0",
           "method": "progress/updated",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000001",
             "metadata": {
               "kind": "file_mutation",
@@ -690,7 +690,7 @@
           "jsonrpc": "2.0",
           "method": "approval/requested",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "approval_id": "00000000-0000-4000-8000-000000000004",
             "turn_id": "00000000-0000-4000-8000-000000000001",
             "tool_name": "diff_edit",
@@ -729,7 +729,7 @@
           "jsonrpc": "2.0",
           "method": "approval/requested",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "approval_id": "00000000-0000-4000-8000-000000000004",
             "turn_id": "00000000-0000-4000-8000-000000000001",
             "tool_name": "diff_edit",
@@ -774,7 +774,7 @@
           "id": "ws-4",
           "method": "diff/preview/get",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "preview_id": "00000000-0000-4000-8000-000000000003"
           }
         }
@@ -788,7 +788,7 @@
           "id": "stdio-4",
           "method": "diff/preview/get",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "preview_id": "00000000-0000-4000-8000-000000000003"
           }
         }
@@ -812,7 +812,7 @@
             "status": "ready",
             "source": "pending_store",
             "preview": {
-              "session_id": "octos-tui:e2e-issue-7",
+              "session_id": "octoscode:e2e-issue-7",
               "preview_id": "00000000-0000-4000-8000-000000000003",
               "title": "Approve fixture diff",
               "files": [
@@ -922,7 +922,7 @@
             "status": "ready",
             "source": "pending_store",
             "preview": {
-              "session_id": "octos-tui:e2e-issue-7",
+              "session_id": "octoscode:e2e-issue-7",
               "preview_id": "00000000-0000-4000-8000-000000000003",
               "title": "Approve fixture diff",
               "files": [
@@ -1071,7 +1071,7 @@
           "jsonrpc": "2.0",
           "method": "approval/decided",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "approval_id": "00000000-0000-4000-8000-000000000004",
             "turn_id": "00000000-0000-4000-8000-000000000001",
             "decision": "approve",
@@ -1091,7 +1091,7 @@
           "jsonrpc": "2.0",
           "method": "approval/decided",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "approval_id": "00000000-0000-4000-8000-000000000004",
             "turn_id": "00000000-0000-4000-8000-000000000001",
             "decision": "approve",
@@ -1119,7 +1119,7 @@
           "jsonrpc": "2.0",
           "method": "tool/started",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000001",
             "tool_call_id": "edit-1",
             "tool_name": "diff_edit",
@@ -1138,7 +1138,7 @@
           "jsonrpc": "2.0",
           "method": "tool/started",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000001",
             "tool_call_id": "edit-1",
             "tool_name": "diff_edit",
@@ -1166,7 +1166,7 @@
           "jsonrpc": "2.0",
           "method": "tool/completed",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000001",
             "tool_call_id": "edit-1",
             "tool_name": "diff_edit",
@@ -1184,7 +1184,7 @@
           "jsonrpc": "2.0",
           "method": "tool/completed",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000001",
             "tool_call_id": "edit-1",
             "tool_name": "diff_edit",
@@ -1207,7 +1207,7 @@
           "jsonrpc": "2.0",
           "method": "task/updated",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "task_id": "00000000-0000-4000-8000-000000000005",
             "title": "Build/test fixture",
             "state": "completed",
@@ -1223,7 +1223,7 @@
           "jsonrpc": "2.0",
           "method": "task/updated",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "task_id": "00000000-0000-4000-8000-000000000005",
             "title": "Build/test fixture",
             "state": "completed",
@@ -1245,7 +1245,7 @@
           "id": "ws-6",
           "method": "turn/start",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000002",
             "input": [
               {
@@ -1265,7 +1265,7 @@
           "id": "stdio-6",
           "method": "turn/start",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000002",
             "input": [
               {
@@ -1289,7 +1289,7 @@
           "jsonrpc": "2.0",
           "method": "turn/started",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000002",
             "timestamp": "2026-05-02T00:00:12Z",
             "runtime_policy_stamp": {
@@ -1316,7 +1316,7 @@
           "jsonrpc": "2.0",
           "method": "turn/started",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000002",
             "timestamp": "2026-05-02T00:00:12Z",
             "runtime_policy_stamp": {
@@ -1348,7 +1348,7 @@
           "jsonrpc": "2.0",
           "method": "task/updated",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "task_id": "00000000-0000-4000-8000-000000000006",
             "title": "Background grep",
             "state": "running",
@@ -1364,7 +1364,7 @@
           "jsonrpc": "2.0",
           "method": "task/updated",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "task_id": "00000000-0000-4000-8000-000000000006",
             "title": "Background grep",
             "state": "running",
@@ -1386,7 +1386,7 @@
           "id": "ws-7",
           "method": "turn/interrupt",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000002"
           }
         }
@@ -1400,7 +1400,7 @@
           "id": "stdio-7",
           "method": "turn/interrupt",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000002"
           }
         }
@@ -1418,7 +1418,7 @@
           "jsonrpc": "2.0",
           "method": "task/updated",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "task_id": "00000000-0000-4000-8000-000000000006",
             "title": "Background grep",
             "state": "failed",
@@ -1434,7 +1434,7 @@
           "jsonrpc": "2.0",
           "method": "task/updated",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "task_id": "00000000-0000-4000-8000-000000000006",
             "title": "Background grep",
             "state": "failed",
@@ -1455,7 +1455,7 @@
           "jsonrpc": "2.0",
           "method": "turn/error",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000002",
             "code": "interrupted",
             "message": "Turn interrupted by user"
@@ -1470,7 +1470,7 @@
           "jsonrpc": "2.0",
           "method": "turn/error",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000002",
             "code": "interrupted",
             "message": "Turn interrupted by user"
@@ -1490,7 +1490,7 @@
           "jsonrpc": "2.0",
           "method": "protocol/replay_lossy",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "dropped_count": 1,
             "last_durable_cursor": {
               "stream": "ui",
@@ -1507,7 +1507,7 @@
           "jsonrpc": "2.0",
           "method": "protocol/replay_lossy",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "dropped_count": 1,
             "last_durable_cursor": {
               "stream": "ui",
@@ -1530,9 +1530,9 @@
           "id": "ws-8",
           "method": "session/open",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "profile_id": "coding",
-            "cwd": "/tmp/octos-tui-fixture",
+            "cwd": "/tmp/octoscode-fixture",
             "after": {
               "stream": "ui",
               "seq": 28
@@ -1549,9 +1549,9 @@
           "id": "stdio-8",
           "method": "session/open",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "profile_id": "coding",
-            "cwd": "/tmp/octos-tui-fixture",
+            "cwd": "/tmp/octoscode-fixture",
             "after": {
               "stream": "ui",
               "seq": 28
@@ -1572,9 +1572,9 @@
           "jsonrpc": "2.0",
           "method": "session/open",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "active_profile_id": "coding",
-            "workspace_root": "/tmp/octos-tui-fixture",
+            "workspace_root": "/tmp/octoscode-fixture",
             "cursor": {
               "stream": "ui",
               "seq": 29
@@ -1590,9 +1590,9 @@
           "jsonrpc": "2.0",
           "method": "session/open",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "active_profile_id": "coding",
-            "workspace_root": "/tmp/octos-tui-fixture",
+            "workspace_root": "/tmp/octoscode-fixture",
             "cursor": {
               "stream": "ui",
               "seq": 29
@@ -1616,7 +1616,7 @@
           "jsonrpc": "2.0",
           "method": "progress/updated",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000001",
             "metadata": {
               "kind": "validator",
@@ -1640,7 +1640,7 @@
           "jsonrpc": "2.0",
           "method": "progress/updated",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000001",
             "metadata": {
               "kind": "validator",
@@ -1672,7 +1672,7 @@
           "jsonrpc": "2.0",
           "method": "progress/updated",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000001",
             "metadata": {
               "kind": "validator",
@@ -1696,7 +1696,7 @@
           "jsonrpc": "2.0",
           "method": "progress/updated",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000001",
             "metadata": {
               "kind": "validator",
@@ -1728,7 +1728,7 @@
           "jsonrpc": "2.0",
           "method": "progress/updated",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000001",
             "metadata": {
               "kind": "artifact",
@@ -1752,7 +1752,7 @@
           "jsonrpc": "2.0",
           "method": "progress/updated",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000001",
             "metadata": {
               "kind": "artifact",
@@ -1785,7 +1785,7 @@
           "jsonrpc": "2.0",
           "method": "tool/denied",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000001",
             "tool_call_id": "web-fetch-1",
             "tool_name": "web_fetch",
@@ -1804,7 +1804,7 @@
           "jsonrpc": "2.0",
           "method": "tool/denied",
           "params": {
-            "session_id": "octos-tui:e2e-issue-7",
+            "session_id": "octoscode:e2e-issue-7",
             "turn_id": "00000000-0000-4000-8000-000000000001",
             "tool_call_id": "web-fetch-1",
             "tool_name": "web_fetch",
@@ -1821,27 +1821,27 @@
     "normalized_sequence": [
       {
         "event": "session.open.request",
-        "session_id": "octos-tui:e2e-issue-7",
-        "cwd": "/tmp/octos-tui-fixture",
+        "session_id": "octoscode:e2e-issue-7",
+        "cwd": "/tmp/octoscode-fixture",
         "profile_id": "coding"
       },
       {
         "event": "session.opened",
-        "session_id": "octos-tui:e2e-issue-7",
-        "cwd": "/tmp/octos-tui-fixture",
+        "session_id": "octoscode:e2e-issue-7",
+        "cwd": "/tmp/octoscode-fixture",
         "profile_id": "coding",
         "cursor_seq": 1
       },
       {
         "event": "message.user",
-        "session_id": "octos-tui:e2e-issue-7",
+        "session_id": "octoscode:e2e-issue-7",
         "turn_id": "00000000-0000-4000-8000-000000000001",
         "role": "user",
         "content": "Add a deterministic fixture and show the validation plan."
       },
       {
         "event": "turn.started",
-        "session_id": "octos-tui:e2e-issue-7",
+        "session_id": "octoscode:e2e-issue-7",
         "turn_id": "00000000-0000-4000-8000-000000000001",
         "runtime_policy_stamp": {
           "profile_id": "coding",
@@ -1859,7 +1859,7 @@
       },
       {
         "event": "message.assistant_delta",
-        "session_id": "octos-tui:e2e-issue-7",
+        "session_id": "octoscode:e2e-issue-7",
         "turn_id": "00000000-0000-4000-8000-000000000001",
         "role": "assistant",
         "content": "Plan\n- [ ] Normalize WebSocket frames\n- [ ] Compare future stdio frames\n\n| Surface | Expected | Notes |\n|---|---|---|\n| Transcript | user before assistant | deterministic |\n| Work pane | sticky plan/status | metadata-backed |",
@@ -1869,14 +1869,14 @@
       },
       {
         "event": "status.update",
-        "session_id": "octos-tui:e2e-issue-7",
+        "session_id": "octoscode:e2e-issue-7",
         "turn_id": "00000000-0000-4000-8000-000000000001",
         "message": "Thinking",
         "placement": "sticky_work_pane"
       },
       {
         "event": "task.pending",
-        "session_id": "octos-tui:e2e-issue-7",
+        "session_id": "octoscode:e2e-issue-7",
         "task_id": "00000000-0000-4000-8000-000000000005",
         "title": "Build/test fixture",
         "state": "pending",
@@ -1884,7 +1884,7 @@
       },
       {
         "event": "task.running",
-        "session_id": "octos-tui:e2e-issue-7",
+        "session_id": "octoscode:e2e-issue-7",
         "task_id": "00000000-0000-4000-8000-000000000005",
         "title": "Build/test fixture",
         "state": "running",
@@ -1892,7 +1892,7 @@
       },
       {
         "event": "activity.tool.started",
-        "session_id": "octos-tui:e2e-issue-7",
+        "session_id": "octoscode:e2e-issue-7",
         "turn_id": "00000000-0000-4000-8000-000000000001",
         "tool_call_id": "shell-1",
         "tool_name": "shell",
@@ -1900,7 +1900,7 @@
       },
       {
         "event": "activity.tool.progress",
-        "session_id": "octos-tui:e2e-issue-7",
+        "session_id": "octoscode:e2e-issue-7",
         "turn_id": "00000000-0000-4000-8000-000000000001",
         "tool_call_id": "shell-1",
         "message": "Running cargo test",
@@ -1908,7 +1908,7 @@
       },
       {
         "event": "activity.tool.completed",
-        "session_id": "octos-tui:e2e-issue-7",
+        "session_id": "octoscode:e2e-issue-7",
         "turn_id": "00000000-0000-4000-8000-000000000001",
         "tool_call_id": "shell-1",
         "tool_name": "shell",
@@ -1920,7 +1920,7 @@
       },
       {
         "event": "task.output_delta",
-        "session_id": "octos-tui:e2e-issue-7",
+        "session_id": "octoscode:e2e-issue-7",
         "task_id": "00000000-0000-4000-8000-000000000005",
         "cursor_offset": 180,
         "line_count": 10,
@@ -1929,13 +1929,13 @@
       },
       {
         "event": "task.output.read_requested",
-        "session_id": "octos-tui:e2e-issue-7",
+        "session_id": "octoscode:e2e-issue-7",
         "task_id": "00000000-0000-4000-8000-000000000005",
         "limit_bytes": 4096
       },
       {
         "event": "task.output.read_result",
-        "session_id": "octos-tui:e2e-issue-7",
+        "session_id": "octoscode:e2e-issue-7",
         "task_id": "00000000-0000-4000-8000-000000000005",
         "line_count": 10,
         "complete": true,
@@ -1943,7 +1943,7 @@
       },
       {
         "event": "progress.file_mutation",
-        "session_id": "octos-tui:e2e-issue-7",
+        "session_id": "octoscode:e2e-issue-7",
         "turn_id": "00000000-0000-4000-8000-000000000001",
         "path": "src/app.rs",
         "operation": "modify",
@@ -1953,7 +1953,7 @@
       },
       {
         "event": "approval.requested",
-        "session_id": "octos-tui:e2e-issue-7",
+        "session_id": "octoscode:e2e-issue-7",
         "turn_id": "00000000-0000-4000-8000-000000000001",
         "approval_id": "00000000-0000-4000-8000-000000000004",
         "tool_name": "diff_edit",
@@ -1970,12 +1970,12 @@
       },
       {
         "event": "diff.preview.requested",
-        "session_id": "octos-tui:e2e-issue-7",
+        "session_id": "octoscode:e2e-issue-7",
         "preview_id": "00000000-0000-4000-8000-000000000003"
       },
       {
         "event": "diff.preview.ready",
-        "session_id": "octos-tui:e2e-issue-7",
+        "session_id": "octoscode:e2e-issue-7",
         "preview_id": "00000000-0000-4000-8000-000000000003",
         "status": "ready",
         "source": "pending_store",
@@ -1991,7 +1991,7 @@
       },
       {
         "event": "approval.decided",
-        "session_id": "octos-tui:e2e-issue-7",
+        "session_id": "octoscode:e2e-issue-7",
         "turn_id": "00000000-0000-4000-8000-000000000001",
         "approval_id": "00000000-0000-4000-8000-000000000004",
         "decision": "approve",
@@ -2000,7 +2000,7 @@
       },
       {
         "event": "activity.tool.started",
-        "session_id": "octos-tui:e2e-issue-7",
+        "session_id": "octoscode:e2e-issue-7",
         "turn_id": "00000000-0000-4000-8000-000000000001",
         "tool_call_id": "edit-1",
         "tool_name": "diff_edit",
@@ -2008,7 +2008,7 @@
       },
       {
         "event": "activity.tool.completed",
-        "session_id": "octos-tui:e2e-issue-7",
+        "session_id": "octoscode:e2e-issue-7",
         "turn_id": "00000000-0000-4000-8000-000000000001",
         "tool_call_id": "edit-1",
         "tool_name": "diff_edit",
@@ -2020,7 +2020,7 @@
       },
       {
         "event": "task.completed",
-        "session_id": "octos-tui:e2e-issue-7",
+        "session_id": "octoscode:e2e-issue-7",
         "task_id": "00000000-0000-4000-8000-000000000005",
         "title": "Build/test fixture",
         "state": "completed",
@@ -2028,14 +2028,14 @@
       },
       {
         "event": "message.user",
-        "session_id": "octos-tui:e2e-issue-7",
+        "session_id": "octoscode:e2e-issue-7",
         "turn_id": "00000000-0000-4000-8000-000000000002",
         "role": "user",
         "content": "Stop the background grep and summarize status."
       },
       {
         "event": "turn.started",
-        "session_id": "octos-tui:e2e-issue-7",
+        "session_id": "octoscode:e2e-issue-7",
         "turn_id": "00000000-0000-4000-8000-000000000002",
         "runtime_policy_stamp": {
           "profile_id": "coding",
@@ -2053,7 +2053,7 @@
       },
       {
         "event": "task.running",
-        "session_id": "octos-tui:e2e-issue-7",
+        "session_id": "octoscode:e2e-issue-7",
         "task_id": "00000000-0000-4000-8000-000000000006",
         "title": "Background grep",
         "state": "running",
@@ -2061,12 +2061,12 @@
       },
       {
         "event": "turn.interrupt.request",
-        "session_id": "octos-tui:e2e-issue-7",
+        "session_id": "octoscode:e2e-issue-7",
         "turn_id": "00000000-0000-4000-8000-000000000002"
       },
       {
         "event": "task.cancelled",
-        "session_id": "octos-tui:e2e-issue-7",
+        "session_id": "octoscode:e2e-issue-7",
         "task_id": "00000000-0000-4000-8000-000000000006",
         "title": "Background grep",
         "state": "failed",
@@ -2074,34 +2074,34 @@
       },
       {
         "event": "turn.cancelled",
-        "session_id": "octos-tui:e2e-issue-7",
+        "session_id": "octoscode:e2e-issue-7",
         "turn_id": "00000000-0000-4000-8000-000000000002",
         "code": "interrupted",
         "message": "Turn interrupted by user"
       },
       {
         "event": "replay.lossy",
-        "session_id": "octos-tui:e2e-issue-7",
+        "session_id": "octoscode:e2e-issue-7",
         "dropped_count": 1,
         "last_durable_seq": 28
       },
       {
         "event": "session.open.request",
-        "session_id": "octos-tui:e2e-issue-7",
-        "cwd": "/tmp/octos-tui-fixture",
+        "session_id": "octoscode:e2e-issue-7",
+        "cwd": "/tmp/octoscode-fixture",
         "profile_id": "coding",
         "cursor_after_seq": 28
       },
       {
         "event": "session.opened",
-        "session_id": "octos-tui:e2e-issue-7",
-        "cwd": "/tmp/octos-tui-fixture",
+        "session_id": "octoscode:e2e-issue-7",
+        "cwd": "/tmp/octoscode-fixture",
         "profile_id": "coding",
         "cursor_seq": 29
       },
       {
         "event": "validator.failed",
-        "session_id": "octos-tui:e2e-issue-7",
+        "session_id": "octoscode:e2e-issue-7",
         "turn_id": "00000000-0000-4000-8000-000000000001",
         "name": "cargo fmt --check",
         "status": "failed",
@@ -2113,7 +2113,7 @@
       },
       {
         "event": "validator.passed",
-        "session_id": "octos-tui:e2e-issue-7",
+        "session_id": "octoscode:e2e-issue-7",
         "turn_id": "00000000-0000-4000-8000-000000000001",
         "name": "cargo fmt --check",
         "status": "passed",
@@ -2125,7 +2125,7 @@
       },
       {
         "event": "artifact.ready",
-        "session_id": "octos-tui:e2e-issue-7",
+        "session_id": "octoscode:e2e-issue-7",
         "turn_id": "00000000-0000-4000-8000-000000000001",
         "artifact_id": "artifact-fixture-summary",
         "title": "AppUI UX marker summary",
@@ -2137,7 +2137,7 @@
       },
       {
         "event": "tool.denied",
-        "session_id": "octos-tui:e2e-issue-7",
+        "session_id": "octoscode:e2e-issue-7",
         "turn_id": "00000000-0000-4000-8000-000000000001",
         "tool_call_id": "web-fetch-1",
         "tool_name": "web_fetch",
@@ -2166,8 +2166,8 @@
       "manual_only": true,
       "duration_minutes": 60,
       "requires_env": [
-        "OCTOS_TUI_UX_LIVE_SOAK=1",
-        "OCTOS_TUI_PROTOCOL_ENDPOINT=ws://127.0.0.1:7777/ui"
+        "OCTOSCODE_UX_LIVE_SOAK=1",
+        "OCTOSCODE_PROTOCOL_ENDPOINT=ws://127.0.0.1:7777/ui"
       ],
       "artifact_dir": "e2e/test-results-tui-coding-ux/<run-id>"
     }

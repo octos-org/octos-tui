@@ -1,5 +1,5 @@
 use eyre::Result;
-use octos_tui::{backend_ensure, cli::Cli, cmd, event_loop};
+use octoscode::{backend_ensure, cli::Cli, cmd, event_loop};
 
 fn main() -> Result<()> {
     color_eyre::install()?;

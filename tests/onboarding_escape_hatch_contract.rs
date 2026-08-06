@@ -17,14 +17,14 @@
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use octos_core::ui_protocol::UiProtocolCapabilities;
-use octos_tui::client_event::{CapabilitiesClientEvent, ClientEvent};
-use octos_tui::event_loop::{KeyAction, handle_terminal_event};
-use octos_tui::menu::MenuBuildResult;
-use octos_tui::model::{
+use octoscode::client_event::{CapabilitiesClientEvent, ClientEvent};
+use octoscode::event_loop::{KeyAction, handle_terminal_event};
+use octoscode::menu::MenuBuildResult;
+use octoscode::model::{
     APPUI_METHOD_PROFILE_LLM_CATALOG, APPUI_METHOD_PROFILE_LOCAL_CREATE, AppState,
     ConfigCapabilitiesListResult,
 };
-use octos_tui::store::Store;
+use octoscode::store::Store;
 
 /// A first-launch store: no sessions, backend advertising the local-solo
 /// profile-create surface. Applying the capabilities event auto-opens the

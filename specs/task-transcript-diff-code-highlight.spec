@@ -18,7 +18,7 @@ bold.
 ## Decisions
 
 - Do not import Livediff dependencies or architecture.
-- Reuse existing octos-tui diff palette (`success`, `danger`, `diff_context_bg`)
+- Reuse existing octoscode diff palette (`success`, `danger`, `diff_context_bg`)
   so inline protocol diff previews and transcript diff snippets read the same.
 - Recognize both explicit diff fences (`diff`, `patch`, `udiff`) and unlabeled
   fences that structurally look like unified diffs (`---/+++/@@` plus `+` or

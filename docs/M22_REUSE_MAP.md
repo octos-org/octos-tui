@@ -5,7 +5,7 @@ Date: 2026-05-21
 Contract:
 [`octos/docs/M22_TUI_SOLO_ONBOARDING_CONTRACT_2026-05-18.md`](../../octos/docs/M22_TUI_SOLO_ONBOARDING_CONTRACT_2026-05-18.md)
 
-The M22 onboarding cluster (issues #51–#58 in `octos-tui`) MUST extend the
+The M22 onboarding cluster (issues #51–#58 in `octoscode`) MUST extend the
 existing first-launch surface instead of introducing a parallel wizard. This
 document records the canonical reuse points so every M22 slice can ground its
 implementation in what is already there.

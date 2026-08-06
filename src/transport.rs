@@ -224,7 +224,7 @@ pub struct ProtocolAppUiBackend {
     /// Latched when the spawned backend refuses to start because another serve
     /// owns the data dir ([`DATA_DIR_LOCKED_MARKER`]). While set, reconnect is
     /// suppressed so we don't respawn a backend that will only crash again —
-    /// the fix for the "two octos-tui competing for the DB" silent crash-loop.
+    /// the fix for the "two octoscode competing for the DB" silent crash-loop.
     fatal_error: Option<String>,
     /// The session to re-open after a reconnect: the MOST RECENTLY opened
     /// session, which tracks the user's current selection (set by `/resume`, a
@@ -507,7 +507,7 @@ impl ProtocolExchange {
                 }
                 // Capture the server-confirmed workspace root so a respawn
                 // reopen scopes to the session's real workspace (#476), not
-                // `launch.cwd` (the shell's dir for a bare `octos-tui`).
+                // `launch.cwd` (the shell's dir for a bare `octoscode`).
                 if let Some(root) = &opened.workspace_root {
                     self.session_workspace_roots
                         .insert(opened.session_id.clone(), root.clone());
@@ -859,10 +859,10 @@ impl StdioTransportDriver {
                 let mut command = shell_command(&self.command);
                 // Multi-instance stdio: isolate this window's runtime (redb
                 // stores, sessions, goals, the serve flock) under a per-cwd
-                // instance dir so several octos-tui windows can run at once
+                // instance dir so several octoscode windows can run at once
                 // while sharing one profile registry. No-op for explicit
                 // --data-dir launches, remote launches, or when opted out via
-                // OCTOS_TUI_SHARED_INSTANCE. Re-spawns (reconnects) resolve to
+                // OCTOSCODE_SHARED_INSTANCE. Re-spawns (reconnects) resolve to
                 // the same dir, so a reconnect re-attaches, not forks.
                 if let Some(instance_dir) = crate::profiles::instance_data_dir_for_launch(
                     Some(&self.command),
@@ -1490,7 +1490,7 @@ impl ProtocolAppUiBackend {
     ///
     /// This intentionally bypasses every server-side guard (no SafePolicy /
     /// blocklist, no sandbox, no `BLOCKED_ENV_VARS` scrub) — that is the
-    /// Claude Code `!` model: the command runs on the machine octos-tui runs
+    /// Claude Code `!` model: the command runs on the machine octoscode runs
     /// on, with the TUI launch dir as cwd and the inherited environment. The
     /// activity card labels it as a local shell command (the mitigation).
     ///
@@ -1635,7 +1635,7 @@ impl ProtocolAppUiBackend {
 
         // The backend refused to start because another octos serve already owns
         // this data directory (redb single-writer). Respawning it would only
-        // crash again — the silent ~5s loop the user hit with two octos-tui
+        // crash again — the silent ~5s loop the user hit with two octoscode
         // windows. Latch a fatal state (suppresses reconnect in
         // `ensure_connected`) and surface one clear, terminal error INSTEAD OF
         // the raw stderr status (suppressed below). Latch once so a
@@ -1643,9 +1643,9 @@ impl ProtocolAppUiBackend {
         let is_fatal_conflict = message.contains(DATA_DIR_LOCKED_MARKER);
         if is_fatal_conflict && self.fatal_error.is_none() {
             let explanation =
-                "Another octos-tui is already running and using this data directory, so this \
+                "Another octoscode is already running and using this data directory, so this \
                  window can't start its own backend (the database allows only one at a time). \
-                 Close the other octos-tui window (or any `octos serve`), then restart this one. \
+                 Close the other octoscode window (or any `octos serve`), then restart this one. \
                  To run two at once, start this one in a workspace with its own data directory."
                     .to_string();
             self.fatal_error = Some(explanation.clone());
@@ -1755,7 +1755,7 @@ impl ProtocolAppUiBackend {
     /// `--session` when nothing has been opened yet.
     fn reopen_session_open_command(&self) -> Option<AppUiCommand> {
         // Prefer the session's server-confirmed workspace root for the reopen
-        // cwd: a bare `octos-tui` (no --cwd) falls back to the shell's
+        // cwd: a bare `octoscode` (no --cwd) falls back to the shell's
         // current_dir for `launch.cwd`, which may differ from the session's
         // workspace. Reopening with the shell's cwd rescopes the session to
         // the wrong `~cwd-<hash>` and presents an empty session (#476). The
@@ -2522,7 +2522,7 @@ fn websocket_request(
 /// Build the `X-Octos-Ui-Features` negotiation value.
 ///
 /// Normally the TUI advertises the full modern feature set. When
-/// `OCTOS_TUI_OLD_SERVER_FEATURES=1` is set it advertises only the
+/// `OCTOSCODE_OLD_SERVER_FEATURES=1` is set it advertises only the
 /// pre-autonomy baseline, dropping the coding autonomy / agent-control /
 /// goal / loop / harness-task-control features. This lets the onboarding
 /// soak exercise the genuine old-server fallback path (header-negotiated):
@@ -2530,7 +2530,7 @@ fn websocket_request(
 /// must hide those controls and never probe `review/start`, `task/list`,
 /// or `task/artifact/*`.
 fn appui_feature_header_value() -> String {
-    let old_server = std::env::var("OCTOS_TUI_OLD_SERVER_FEATURES").as_deref() == Ok("1");
+    let old_server = std::env::var("OCTOSCODE_OLD_SERVER_FEATURES").as_deref() == Ok("1");
     appui_feature_header_for(old_server)
 }
 
@@ -5203,7 +5203,7 @@ impl AppUiBackend for MockAppUiBackend {
 }
 
 fn mock_approval_kind() -> String {
-    std::env::var("OCTOS_TUI_MOCK_APPROVAL_KIND").unwrap_or_else(|_| approval_kinds::COMMAND.into())
+    std::env::var("OCTOSCODE_MOCK_APPROVAL_KIND").unwrap_or_else(|_| approval_kinds::COMMAND.into())
 }
 
 fn mock_model_status(selected: bool) -> ModelStatus {
@@ -8189,7 +8189,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock is valid")
             .as_nanos();
-        let marker = std::env::temp_dir().join(format!("octos-tui-backoff-{nonce}.log"));
+        let marker = std::env::temp_dir().join(format!("octoscode-backoff-{nonce}.log"));
         let command = format!("echo spawned >> {}; exit 7", marker.display());
 
         let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
@@ -8993,7 +8993,7 @@ mod tests {
         assert!(error.message.contains("transport closed for test"));
     }
 
-    /// Two octos-tui competing for the DB: the spawned backend refuses to start
+    /// Two octoscode competing for the DB: the spawned backend refuses to start
     /// (its stderr tail carries `DATA_DIR_LOCKED_MARKER`). The client must latch
     /// a fatal state — surface ONE clean terminal error (not the raw stderr
     /// status) and suppress reconnect so it stops the silent respawn crash-loop.
@@ -9024,7 +9024,7 @@ mod tests {
         };
         assert_eq!(error.code, DATA_DIR_LOCKED_CODE);
         assert!(
-            error.message.contains("Close the other octos-tui"),
+            error.message.contains("Close the other octoscode"),
             "message must be the actionable explanation; got: {}",
             error.message
         );
@@ -10443,7 +10443,7 @@ mod tests {
 
     #[test]
     fn reopen_prefers_server_confirmed_workspace_root_over_launch_cwd() {
-        // Regression (#476): a bare `octos-tui` (no --cwd) falls back to the
+        // Regression (#476): a bare `octoscode` (no --cwd) falls back to the
         // shell's current_dir for `launch.cwd`, which may differ from the
         // session's real workspace. A respawn reopen must scope to the
         // server-confirmed `workspace_root` from `session/opened`, not

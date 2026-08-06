@@ -8,7 +8,7 @@ estimate: 1d
 
 ## 意图
 
-`octos-tui doctor --endpoint ...` 原先只记录 WS endpoint 已配置，并继续跑本地
+`octoscode doctor --endpoint ...` 原先只记录 WS endpoint 已配置，并继续跑本地
 结构性 protocol-skew 检查；这无法发现真实 server 是否可连、是否支持
 `config/capabilities/list`、以及 live capability set 是否满足 TUI 运行所需。
 本任务补齐 doctor 的 live AppUI capability probe，并把本轮发现的严格质量门

@@ -9,9 +9,9 @@
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use octos_core::SessionKey;
-use octos_tui::event_loop::{KeyAction, handle_terminal_event};
-use octos_tui::model::{AppState, FocusPane, SessionView};
-use octos_tui::store::Store;
+use octoscode::event_loop::{KeyAction, handle_terminal_event};
+use octoscode::model::{AppState, FocusPane, SessionView};
+use octoscode::store::Store;
 
 fn composer_store(text: &str, cursor: Option<usize>) -> Store {
     let session = SessionView {

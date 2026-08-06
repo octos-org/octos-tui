@@ -1,6 +1,6 @@
 //! `@` composer file picker (#363, v1: path insert only).
 //!
-//! Scans the ACTIVE workspace root on the machine octos-tui runs on and feeds
+//! Scans the ACTIVE workspace root on the machine octoscode runs on and feeds
 //! the searchable `file-picker` menu (see `menu::providers::file_picker_menu`).
 //! Selecting a row inserts the file's RELATIVE path at the composer cursor —
 //! no file contents are read or embedded, and no protocol traffic is involved.
@@ -136,7 +136,7 @@ mod tests {
         fn new(tag: &str) -> Self {
             let mut dir = std::env::temp_dir();
             dir.push(format!(
-                "octos-tui-file-picker-{tag}-{}-{}",
+                "octoscode-file-picker-{tag}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)

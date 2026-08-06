@@ -14,7 +14,7 @@
 //!   with this crate's per-session drafts on a session switch.
 //!
 //! Entries are global across sessions and persisted to
-//! `~/.config/octos-tui/history.jsonl` (one JSON-encoded string per line,
+//! `~/.config/octoscode/history.jsonl` (one JSON-encoded string per line,
 //! newest last), mirroring the TUI config-dir convention in
 //! [`crate::cli::default_config_path`]. Persistence is **opt-in via
 //! [`ComposerHistory::persist_path`]**: it is `None` by default (and after
@@ -156,7 +156,7 @@ impl ComposerHistory {
 
     // ---- persistence (best-effort; never panics, never blocks a turn) ----
 
-    /// `~/.config/octos-tui/history.jsonl` (HOME, then USERPROFILE on Windows),
+    /// `~/.config/octoscode/history.jsonl` (HOME, then USERPROFILE on Windows),
     /// mirroring [`crate::cli::default_config_path`].
     pub fn default_path() -> Option<PathBuf> {
         history_path_from_home(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))
@@ -253,7 +253,7 @@ fn rewrite_history_file(path: &Path, entries: &[String]) -> std::io::Result<()> 
 
 /// Per-process compaction temp beside `path`. The name embeds the pid: the old
 /// FIXED `history.jsonl.compact` name was shared across processes, so two
-/// `octos-tui` instances compacting the same file interleaved their writes and
+/// `octoscode` instances compacting the same file interleaved their writes and
 /// could publish a torn file via rename.
 fn compaction_temp_path(path: &Path) -> PathBuf {
     path.with_extension(format!("jsonl.compact.{}", std::process::id()))
@@ -295,7 +295,7 @@ fn history_path_from_home(
     Some(
         PathBuf::from(base)
             .join(".config")
-            .join("octos-tui")
+            .join("octoscode")
             .join("history.jsonl"),
     )
 }
@@ -305,7 +305,7 @@ fn history_path_from_home(
 /// pasted, so keep it unreadable by other users. The JSON line + trailing
 /// newline are written in ONE `write_all`, which is atomic with `O_APPEND` for
 /// the small lines we write (avoids interleaved/torn lines when more than one
-/// `octos-tui` shares the file).
+/// `octoscode` shares the file).
 fn append_entry(path: &Path, entry: &str) -> std::io::Result<()> {
     let trimmed = entry.trim();
     if trimmed.is_empty() {
@@ -367,7 +367,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock is valid")
             .as_nanos();
-        std::env::temp_dir().join(format!("octos-tui-hist-{name}-{nonce}.jsonl"))
+        std::env::temp_dir().join(format!("octoscode-hist-{name}-{nonce}.jsonl"))
     }
 
     #[test]
@@ -503,9 +503,9 @@ mod tests {
     #[test]
     fn compaction_temp_path_is_unique_per_process() {
         // Fix #9 (b): the old fixed `history.jsonl.compact` name was shared
-        // across processes — two octos-tui instances compacting the same file
+        // across processes — two octoscode instances compacting the same file
         // interleave writes / publish a torn file via rename.
-        let path = PathBuf::from("/tmp/octos-tui-hist/history.jsonl");
+        let path = PathBuf::from("/tmp/octoscode-hist/history.jsonl");
         let tmp = compaction_temp_path(&path);
         let name = tmp.file_name().unwrap().to_string_lossy().into_owned();
         assert!(
@@ -730,7 +730,7 @@ mod tests {
     #[test]
     fn history_path_prefers_home_then_userprofile() {
         let home = history_path_from_home(Some("/home/u".into()), Some("C:\\u".into())).unwrap();
-        assert!(home.ends_with(".config/octos-tui/history.jsonl"));
+        assert!(home.ends_with(".config/octoscode/history.jsonl"));
         assert!(home.starts_with("/home/u"));
         let win = history_path_from_home(None, Some("C:\\u".into())).unwrap();
         assert!(win.starts_with("C:\\u"));

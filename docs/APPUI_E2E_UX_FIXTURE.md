@@ -2,10 +2,10 @@
 
 Issues:
 
-- https://github.com/octos-org/octos-tui/issues/7
-- https://github.com/octos-org/octos-tui/issues/21
-- https://github.com/octos-org/octos-tui/issues/22
-- https://github.com/octos-org/octos-tui/issues/24
+- https://github.com/octos-org/octoscode/issues/7
+- https://github.com/octos-org/octoscode/issues/21
+- https://github.com/octos-org/octoscode/issues/22
+- https://github.com/octos-org/octoscode/issues/24
 
 This repo owns a deterministic short fixture for AppUI coding-session UX parity:
 
@@ -109,7 +109,7 @@ the host provides the `script` command. It writes artifacts to
 For fixture self-checking, run:
 
 ```bash
-OCTOS_TUI_CAPTURE_SELF_TEST=1 scripts/capture-appui-ux-pty.sh
+OCTOSCODE_CAPTURE_SELF_TEST=1 scripts/capture-appui-ux-pty.sh
 ```
 
 The self-test verifies the marker validator notices a deliberately absent marker
@@ -121,8 +121,8 @@ M12-D/G evidence is captured by the onboarding tmux runner's solo lane:
 
 ```bash
 scripts/run-onboarding-tmux-soak.sh solo-self-test
-OCTOS_TUI_SOAK_TRANSPORT=stdio scripts/run-onboarding-tmux-soak.sh drive-solo
-OCTOS_TUI_SOAK_TRANSPORT=stdio OCTOS_TUI_SOAK_RUN_ID=<run-id> scripts/run-onboarding-tmux-soak.sh verify-solo
+OCTOSCODE_SOAK_TRANSPORT=stdio scripts/run-onboarding-tmux-soak.sh drive-solo
+OCTOSCODE_SOAK_TRANSPORT=stdio OCTOSCODE_SOAK_RUN_ID=<run-id> scripts/run-onboarding-tmux-soak.sh verify-solo
 ```
 
 This lane is provider-free. It records `profile/local/create` local onboarding,
@@ -143,7 +143,7 @@ config fixture, and captures:
 
 Before M12-A/C backend support lands, `soak-summary.json` may report
 `"status": "blocked"` with explicit capability blockers. Use
-`OCTOS_TUI_SOAK_SOLO_STRICT=1` once the backend advertises and implements
+`OCTOSCODE_SOAK_SOLO_STRICT=1` once the backend advertises and implements
 `profile/local/create`, `permission/profile/*`, `mcp/config/*`,
 `mcp/config/test`, and `tool/config/set_enabled`.
 
@@ -155,8 +155,8 @@ because that harness owns server startup and terminal captures.
 Minimum environment:
 
 ```bash
-OCTOS_TUI_UX_LIVE_SOAK=1 \
-OCTOS_TUI_PROTOCOL_ENDPOINT=ws://127.0.0.1:7777/ui \
+OCTOSCODE_UX_LIVE_SOAK=1 \
+OCTOSCODE_PROTOCOL_ENDPOINT=ws://127.0.0.1:7777/ui \
 scripts/validate-appui-ux-fixture.sh
 ```
 
@@ -200,4 +200,4 @@ The local lane now captures terminal output and semantic markers, but it still
 does not replace a full live soak. Exact rendered cell alignment, interactive
 expand/collapse, narrow layout overlap checks, and model-backed UX comparison
 still need the parent `octos` tmux harness or a future render-snapshot hook from
-`octos-tui`.
+`octoscode`.

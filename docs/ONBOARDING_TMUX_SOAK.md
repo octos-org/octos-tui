@@ -1,7 +1,7 @@
 # Onboarding Tmux Soak
 
 This is the live interactive acceptance test for OTP login and dashboard-parity
-LLM provider onboarding in octos-tui.
+LLM provider onboarding in octoscode.
 
 For M12 solo mode, the same runner also has a no-OTP local onboarding lane that
 drives AppUI directly through the live tmux environment and captures the runtime
@@ -94,7 +94,7 @@ scripts/run-onboarding-tmux-soak.sh help
 `self-test` is local and synthetic. It does not start the backend; it creates
 temporary tmux panes and a temporary profile JSON, runs `verify`, checks
 required artifact creation and redaction, then proves verification fails if
-`OCTOS_TUI_SOAK_API_KEY` appears in any artifact.
+`OCTOSCODE_SOAK_API_KEY` appears in any artifact.
 
 `solo-self-test` delegates to the backend M12 fixture probe. It validates the
 solo artifact schema and proves the retained AppUI transcript contains no OTP
@@ -107,23 +107,23 @@ tmux evidence:
 
 ```sh
 OCTOS_BIN=/path/to/octos \
-OCTOS_TUI_BIN=/path/to/octos-tui \
+OCTOSCODE_BIN=/path/to/octoscode \
 scripts/run-onboarding-tmux-soak.sh preflight-live
 ```
 
 `preflight-live` checks for tmux, an API-enabled `octos serve`, an executable
-`octos-tui`, and a provider credential source. By default the provider source
-can be `OCTOS_TUI_SOAK_API_KEY`, one of `OCTOS_TUI_SOAK_PROVIDER_ENV_VARS`, or
-pre-seeded profile `env_vars`. Set `OCTOS_TUI_SOAK_REQUIRE_LIVE_PROVIDER=0`
+`octoscode`, and a provider credential source. By default the provider source
+can be `OCTOSCODE_SOAK_API_KEY`, one of `OCTOSCODE_SOAK_PROVIDER_ENV_VARS`, or
+pre-seeded profile `env_vars`. Set `OCTOSCODE_SOAK_REQUIRE_LIVE_PROVIDER=0`
 only for provider-free dry runs that cannot close #31, #40, or #44. The command
 writes `live-preflight.json` into the retained artifact directory even when a
 required check fails, so blocker comments can link the exact failed readiness
 state without exposing provider secrets. The JSON includes host and OS details,
 profile/session/runtime context, the tmux version, backend `octos --version`
-output when available, and the `octos-tui --version` status for the executable
+output when available, and the `octoscode --version` status for the executable
 under test. It records the provider environment variable names checked, but
 never their values. When the source checkouts are available, it also records the
-`octos` and `octos-tui` Git commits used by the run.
+`octos` and `octoscode` Git commits used by the run.
 
 ## Live Closure Checklist
 
@@ -136,7 +136,7 @@ For each issue, keep the retained artifact directories outside generated
 workspace paths that should not be committed. Then post a GitHub issue comment
 with:
 
-- the `octos` and `octos-tui` commits;
+- the `octos` and `octoscode` commits;
 - host, OS, tmux version, transport, and provider credential source without the
   secret value;
 - exact commands;
@@ -159,7 +159,7 @@ Run live preflight first:
 
 ```sh
 OCTOS_BIN=/path/to/octos \
-OCTOS_TUI_BIN=/path/to/octos-tui \
+OCTOSCODE_BIN=/path/to/octoscode \
 scripts/run-onboarding-tmux-soak.sh preflight-live
 ```
 
@@ -185,29 +185,29 @@ drives the MCP/tool config fixture through AppUI:
 
 Current backends may not have M12-A/C fully wired. In that case the runner keeps
 the evidence files and records blockers in `soak-summary.json`; set
-`OCTOS_TUI_SOAK_SOLO_STRICT=1` when the backend is ready to require a pass.
+`OCTOSCODE_SOAK_SOLO_STRICT=1` when the backend is ready to require a pass.
 Strict mode also requires `workspace-cwd-open`,
 `approval-never-sandbox-active`, and `danger-full-access-approval-never` rows
 to be `ok`. Override or extend this list with
-`OCTOS_TUI_SOAK_REQUIRED_SOLO_CASES` for a specific closure bundle.
+`OCTOSCODE_SOAK_REQUIRED_SOLO_CASES` for a specific closure bundle.
 MCP/tool config blockers are recorded the same way until the backend advertises
 `mcp/config/*`, `mcp/config/test`, and `tool/config/set_enabled`.
-Set `OCTOS_TUI_SOAK_EXPECT_TENANT_NEGATIVE=1` during `verify-solo` when the
+Set `OCTOSCODE_SOAK_EXPECT_TENANT_NEGATIVE=1` during `verify-solo` when the
 tenant/cloud dangerous-mode rejection row is part of the closure bundle; the
 verifier then requires `tenant-danger-rejection` to pass with server-side
 rejection evidence in `soak-summary.json`.
 For the full M12-G closure bundle, run `verify-solo-closure`; it enables strict
 solo verification, requires tenant-negative evidence, and also verifies the
 multiline composer capture. If multiline evidence was retained in a separate
-run, set `OCTOS_TUI_SOAK_MULTILINE_ARTIFACT_DIR=<path>`.
+run, set `OCTOSCODE_SOAK_MULTILINE_ARTIFACT_DIR=<path>`.
 For final transport coverage, retain one strict stdio solo run and one strict
 WebSocket solo run, then run `verify-solo-transport-closure`:
 
 ```sh
-OCTOS_TUI_SOAK_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<solo-run-id> \
-OCTOS_TUI_SOAK_MULTILINE_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<multiline-run-id> \
-OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<stdio-run-id> \
-OCTOS_TUI_SOAK_WS_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<ws-run-id> \
+OCTOSCODE_SOAK_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<solo-run-id> \
+OCTOSCODE_SOAK_MULTILINE_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<multiline-run-id> \
+OCTOSCODE_SOAK_STDIO_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<stdio-run-id> \
+OCTOSCODE_SOAK_WS_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<ws-run-id> \
 scripts/run-onboarding-tmux-soak.sh verify-solo-transport-closure
 ```
 
@@ -219,32 +219,32 @@ binary that exposes `serve`.
 Provider-free stdio dry-run:
 
 ```sh
-OCTOS_TUI_SOAK_TRANSPORT=stdio \
-OCTOS_TUI_SOAK_RUN_ID=solo-stdio-$(date -u +%Y%m%dT%H%M%SZ) \
+OCTOSCODE_SOAK_TRANSPORT=stdio \
+OCTOSCODE_SOAK_RUN_ID=solo-stdio-$(date -u +%Y%m%dT%H%M%SZ) \
 scripts/run-onboarding-tmux-soak.sh drive-solo
 
-OCTOS_TUI_SOAK_TRANSPORT=stdio \
-OCTOS_TUI_SOAK_RUN_ID=<same-run-id> \
+OCTOSCODE_SOAK_TRANSPORT=stdio \
+OCTOSCODE_SOAK_RUN_ID=<same-run-id> \
 scripts/run-onboarding-tmux-soak.sh verify-solo
 ```
 
 WebSocket tmux run:
 
 ```sh
-OCTOS_TUI_SOAK_TRANSPORT=ws scripts/run-onboarding-tmux-soak.sh start
-OCTOS_TUI_SOAK_TRANSPORT=ws OCTOS_TUI_SOAK_RUN_ID=<run-id> scripts/run-onboarding-tmux-soak.sh drive-solo
-OCTOS_TUI_SOAK_TRANSPORT=ws OCTOS_TUI_SOAK_RUN_ID=<run-id> scripts/run-onboarding-tmux-soak.sh verify-solo
+OCTOSCODE_SOAK_TRANSPORT=ws scripts/run-onboarding-tmux-soak.sh start
+OCTOSCODE_SOAK_TRANSPORT=ws OCTOSCODE_SOAK_RUN_ID=<run-id> scripts/run-onboarding-tmux-soak.sh drive-solo
+OCTOSCODE_SOAK_TRANSPORT=ws OCTOSCODE_SOAK_RUN_ID=<run-id> scripts/run-onboarding-tmux-soak.sh verify-solo
 ```
 
 First-launch splash capture:
 
 ```sh
-OCTOS_TUI_SOAK_FIRST_LAUNCH_CAPTURE=1 \
-OCTOS_TUI_SOAK_TRANSPORT=stdio \
-OCTOS_TUI_SOAK_RUN_ID=first-launch-$(date -u +%Y%m%dT%H%M%SZ) \
+OCTOSCODE_SOAK_FIRST_LAUNCH_CAPTURE=1 \
+OCTOSCODE_SOAK_TRANSPORT=stdio \
+OCTOSCODE_SOAK_RUN_ID=first-launch-$(date -u +%Y%m%dT%H%M%SZ) \
 scripts/run-onboarding-tmux-soak.sh start
 
-OCTOS_TUI_SOAK_RUN_ID=<same-run-id> \
+OCTOSCODE_SOAK_RUN_ID=<same-run-id> \
 scripts/run-onboarding-tmux-soak.sh verify-first-launch
 ```
 
@@ -260,14 +260,14 @@ launch shape for provider-missing and coding-session lanes.
 Missing-provider recovery capture:
 
 ```sh
-OCTOS_TUI_SOAK_TRANSPORT=stdio \
-OCTOS_TUI_SOAK_RUN_ID=provider-missing-$(date -u +%Y%m%dT%H%M%SZ) \
+OCTOSCODE_SOAK_TRANSPORT=stdio \
+OCTOSCODE_SOAK_RUN_ID=provider-missing-$(date -u +%Y%m%dT%H%M%SZ) \
 scripts/run-onboarding-tmux-soak.sh start
 
-OCTOS_TUI_SOAK_RUN_ID=<same-run-id> \
+OCTOSCODE_SOAK_RUN_ID=<same-run-id> \
 scripts/run-onboarding-tmux-soak.sh drive-provider-missing
 
-OCTOS_TUI_SOAK_RUN_ID=<same-run-id> \
+OCTOSCODE_SOAK_RUN_ID=<same-run-id> \
 scripts/run-onboarding-tmux-soak.sh verify-provider-missing
 ```
 
@@ -279,16 +279,16 @@ splash, has already opened a coding session, or contains OTP/AppUI error text.
 Permissions capture:
 
 ```sh
-OCTOS_TUI_SOAK_TRANSPORT=stdio \
-OCTOS_TUI_SOAK_INIT_PROFILE_LLM=1 \
-OCTOS_TUI_SOAK_API_KEY=<secret-value> \
-OCTOS_TUI_SOAK_RUN_ID=permissions-$(date -u +%Y%m%dT%H%M%SZ) \
+OCTOSCODE_SOAK_TRANSPORT=stdio \
+OCTOSCODE_SOAK_INIT_PROFILE_LLM=1 \
+OCTOSCODE_SOAK_API_KEY=<secret-value> \
+OCTOSCODE_SOAK_RUN_ID=permissions-$(date -u +%Y%m%dT%H%M%SZ) \
 scripts/run-onboarding-tmux-soak.sh start
 
-OCTOS_TUI_SOAK_RUN_ID=<same-run-id> \
+OCTOSCODE_SOAK_RUN_ID=<same-run-id> \
 scripts/run-onboarding-tmux-soak.sh drive-permissions
 
-OCTOS_TUI_SOAK_RUN_ID=<same-run-id> \
+OCTOSCODE_SOAK_RUN_ID=<same-run-id> \
 scripts/run-onboarding-tmux-soak.sh verify-permissions
 ```
 
@@ -302,13 +302,13 @@ provider setup or contains AppUI error text.
 For M9/M19 approval-denial evidence:
 
 ```sh
-OCTOS_TUI_SOAK_RUN_ID=approval-denial-$(date -u +%Y%m%dT%H%M%SZ) \
+OCTOSCODE_SOAK_RUN_ID=approval-denial-$(date -u +%Y%m%dT%H%M%SZ) \
 scripts/run-onboarding-tmux-soak.sh start
 
-OCTOS_TUI_SOAK_RUN_ID=<same-run-id> \
+OCTOSCODE_SOAK_RUN_ID=<same-run-id> \
 scripts/run-onboarding-tmux-soak.sh drive-approval-denial
 
-OCTOS_TUI_SOAK_RUN_ID=<same-run-id> \
+OCTOSCODE_SOAK_RUN_ID=<same-run-id> \
 scripts/run-onboarding-tmux-soak.sh verify-approval-denial
 ```
 
@@ -322,13 +322,13 @@ blocked approval prompt.
 For M13 supervised task inspection evidence:
 
 ```sh
-OCTOS_TUI_SOAK_RUN_ID=task-subagent-$(date -u +%Y%m%dT%H%M%SZ) \
+OCTOSCODE_SOAK_RUN_ID=task-subagent-$(date -u +%Y%m%dT%H%M%SZ) \
 scripts/run-onboarding-tmux-soak.sh start
 
-OCTOS_TUI_SOAK_RUN_ID=<same-run-id> \
+OCTOSCODE_SOAK_RUN_ID=<same-run-id> \
 scripts/run-onboarding-tmux-soak.sh drive-task-subagent-tree
 
-OCTOS_TUI_SOAK_RUN_ID=<same-run-id> \
+OCTOSCODE_SOAK_RUN_ID=<same-run-id> \
 scripts/run-onboarding-tmux-soak.sh verify-task-subagent-tree
 ```
 
@@ -344,23 +344,23 @@ transport.
 WebSocket:
 
 ```sh
-OCTOS_TUI_SOAK_TRANSPORT=ws \
-OCTOS_TUI_SOAK_RUN_ID=<same-run-id> \
+OCTOSCODE_SOAK_TRANSPORT=ws \
+OCTOSCODE_SOAK_RUN_ID=<same-run-id> \
 scripts/run-onboarding-tmux-soak.sh drive-task-subagent-reconnect
 ```
 
 Stdio:
 
 ```sh
-OCTOS_TUI_SOAK_TRANSPORT=stdio \
-OCTOS_TUI_SOAK_RUN_ID=<same-run-id> \
+OCTOSCODE_SOAK_TRANSPORT=stdio \
+OCTOSCODE_SOAK_RUN_ID=<same-run-id> \
 scripts/run-onboarding-tmux-soak.sh drive-task-subagent-reconnect
 ```
 
 Then verify the retained artifact directory:
 
 ```sh
-OCTOS_TUI_SOAK_RUN_ID=<same-run-id> \
+OCTOSCODE_SOAK_RUN_ID=<same-run-id> \
 scripts/run-onboarding-tmux-soak.sh verify-task-subagent-reconnect
 ```
 
@@ -376,10 +376,10 @@ For the old-server fallback leg, retain a capture and transcript from a backend
 that does not advertise supervised task inspection capabilities, then run:
 
 ```sh
-OCTOS_TUI_SOAK_RUN_ID=<old-server-run-id> \
+OCTOSCODE_SOAK_RUN_ID=<old-server-run-id> \
 scripts/run-onboarding-tmux-soak.sh drive-task-subagent-old-server-fallback
 
-OCTOS_TUI_SOAK_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<run-id> \
+OCTOSCODE_SOAK_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<run-id> \
 scripts/run-onboarding-tmux-soak.sh verify-task-subagent-old-server-fallback
 ```
 
@@ -392,11 +392,11 @@ restart/reconnect run, the old-server fallback run, and one WebSocket plus one
 stdio transcript pair. Then run:
 
 ```sh
-OCTOS_TUI_SOAK_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<task-run-id> \
-OCTOS_TUI_SOAK_TASK_RECONNECT_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<reconnect-run-id> \
-OCTOS_TUI_SOAK_TASK_OLD_SERVER_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<old-server-run-id> \
-OCTOS_TUI_SOAK_WS_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<ws-run-id> \
-OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<stdio-run-id> \
+OCTOSCODE_SOAK_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<task-run-id> \
+OCTOSCODE_SOAK_TASK_RECONNECT_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<reconnect-run-id> \
+OCTOSCODE_SOAK_TASK_OLD_SERVER_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<old-server-run-id> \
+OCTOSCODE_SOAK_WS_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<ws-run-id> \
+OCTOSCODE_SOAK_STDIO_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<stdio-run-id> \
 scripts/run-onboarding-tmux-soak.sh verify-task-subagent-closure
 ```
 
@@ -409,22 +409,22 @@ For M15 production autonomy evidence, start the normal tmux harness against a
 production-capable backend and drive the autonomy path:
 
 ```sh
-OCTOS_TUI_SOAK_RUN_ID=autonomy-live-$(date -u +%Y%m%dT%H%M%SZ) \
+OCTOSCODE_SOAK_RUN_ID=autonomy-live-$(date -u +%Y%m%dT%H%M%SZ) \
 scripts/run-onboarding-tmux-soak.sh start
 
-OCTOS_TUI_SOAK_RUN_ID=<same-run-id> \
+OCTOSCODE_SOAK_RUN_ID=<same-run-id> \
 scripts/run-onboarding-tmux-soak.sh drive-autonomy-live
 ```
 
 `drive-autonomy-live` sends `/goal`, fixed/self-paced/maintenance `/loop`
 commands, `/loop list`, a supervised review prompt, and `/agents list`. Set
-`OCTOS_TUI_SOAK_AUTONOMY_LOOP_ID=<loop-id>` after a loop is visible to also
+`OCTOSCODE_SOAK_AUTONOMY_LOOP_ID=<loop-id>` after a loop is visible to also
 drive `/loop fire-now`, `/loop pause`, and `/loop resume`. Set
-`OCTOS_TUI_SOAK_AUTONOMY_AGENT_ID=<agent-id>` after an agent is visible to also
+`OCTOSCODE_SOAK_AUTONOMY_AGENT_ID=<agent-id>` after an agent is visible to also
 drive `/agents status`, `/agents output`, and `/agents artifacts`.
 
 If the backend writes M15 JSON evidence outside the TUI artifact directory, set
-`OCTOS_TUI_M15_UX_OUTPUT_DIR=<path>` before `drive-autonomy-live`; the driver
+`OCTOSCODE_M15_UX_OUTPUT_DIR=<path>` before `drive-autonomy-live`; the driver
 copies it under `m15-evidence/` for the verifier.
 
 The driver keeps per-step captures and also writes
@@ -434,7 +434,7 @@ The driver keeps per-step captures and also writes
 Then point the verifier at the retained live artifact directory:
 
 ```sh
-OCTOS_TUI_SOAK_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<run-id> \
+OCTOSCODE_SOAK_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<run-id> \
 scripts/run-onboarding-tmux-soak.sh verify-autonomy-live
 ```
 
@@ -452,23 +452,23 @@ ledgers, then run one lane per transport.
 WebSocket:
 
 ```sh
-OCTOS_TUI_SOAK_TRANSPORT=ws \
-OCTOS_TUI_SOAK_RUN_ID=<same-run-id> \
+OCTOSCODE_SOAK_TRANSPORT=ws \
+OCTOSCODE_SOAK_RUN_ID=<same-run-id> \
 scripts/run-onboarding-tmux-soak.sh drive-autonomy-reconnect
 ```
 
 Stdio:
 
 ```sh
-OCTOS_TUI_SOAK_TRANSPORT=stdio \
-OCTOS_TUI_SOAK_RUN_ID=<same-run-id> \
+OCTOSCODE_SOAK_TRANSPORT=stdio \
+OCTOSCODE_SOAK_RUN_ID=<same-run-id> \
 scripts/run-onboarding-tmux-soak.sh drive-autonomy-reconnect
 ```
 
 Then verify the retained artifact directory:
 
 ```sh
-OCTOS_TUI_SOAK_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<run-id> \
+OCTOSCODE_SOAK_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<run-id> \
 scripts/run-onboarding-tmux-soak.sh verify-autonomy-reconnect
 ```
 
@@ -486,10 +486,10 @@ restart/reconnect run, and one WebSocket plus one stdio transcript pair. Then
 run:
 
 ```sh
-OCTOS_TUI_SOAK_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<autonomy-run-id> \
-OCTOS_TUI_SOAK_AUTONOMY_RECONNECT_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<reconnect-run-id> \
-OCTOS_TUI_SOAK_WS_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<ws-run-id> \
-OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<stdio-run-id> \
+OCTOSCODE_SOAK_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<autonomy-run-id> \
+OCTOSCODE_SOAK_AUTONOMY_RECONNECT_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<reconnect-run-id> \
+OCTOSCODE_SOAK_WS_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<ws-run-id> \
+OCTOSCODE_SOAK_STDIO_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<stdio-run-id> \
 scripts/run-onboarding-tmux-soak.sh verify-autonomy-closure
 ```
 
@@ -502,8 +502,8 @@ After retaining one WebSocket artifact directory and one stdio artifact
 directory for the same live scenario, compare their AppUI method traffic:
 
 ```sh
-OCTOS_TUI_SOAK_WS_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<ws-run-id> \
-OCTOS_TUI_SOAK_STDIO_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<stdio-run-id> \
+OCTOSCODE_SOAK_WS_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<ws-run-id> \
+OCTOSCODE_SOAK_STDIO_ARTIFACT_DIR=e2e/test-results-tui-onboarding/<stdio-run-id> \
 scripts/run-onboarding-tmux-soak.sh verify-transport-parity
 ```
 
@@ -512,7 +512,7 @@ the WebSocket directory must record `transport=ws`, and the stdio directory
 must record `transport=stdio`. It then reads `appui-transcript.jsonl` from each
 directory, including the `m15-evidence/` subdirectory when present, normalizes
 `client_to_server`/`tx` and `server_to_client`/`rx`, then compares the
-direction + method sequence. Set `OCTOS_TUI_SOAK_TRANSPORT_PARITY_MODE=set`
+direction + method sequence. Set `OCTOSCODE_SOAK_TRANSPORT_PARITY_MODE=set`
 only when the issue acceptance requires method-set parity rather than ordering
 parity.
 
@@ -521,10 +521,10 @@ parity.
 For replay-lossy and dropped-completion regression evidence:
 
 ```sh
-OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+OCTOSCODE_SOAK_RUN_ID=<run-id> \
 scripts/run-onboarding-tmux-soak.sh drive-dropped-completion-backpressure
 
-OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+OCTOSCODE_SOAK_RUN_ID=<run-id> \
 scripts/run-onboarding-tmux-soak.sh verify-backpressure
 ```
 
@@ -540,10 +540,10 @@ It also requires a `protocol/replay_lossy` notification in the transcript.
 For live interrupt and reconnect evidence:
 
 ```sh
-OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+OCTOSCODE_SOAK_RUN_ID=<run-id> \
 scripts/run-onboarding-tmux-soak.sh drive-interrupt-reconnect
 
-OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+OCTOSCODE_SOAK_RUN_ID=<run-id> \
 scripts/run-onboarding-tmux-soak.sh verify-interrupt-reconnect
 ```
 
@@ -564,10 +564,10 @@ request, and session hydration/status evidence.
 For validator evidence in a live coding run:
 
 ```sh
-OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+OCTOSCODE_SOAK_RUN_ID=<run-id> \
 scripts/run-onboarding-tmux-soak.sh drive-validator-cycle
 
-OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+OCTOSCODE_SOAK_RUN_ID=<run-id> \
 scripts/run-onboarding-tmux-soak.sh verify-validator-cycle
 ```
 
@@ -582,10 +582,10 @@ must appear before the passing rerun.
 For long-output folding evidence:
 
 ```sh
-OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+OCTOSCODE_SOAK_RUN_ID=<run-id> \
 scripts/run-onboarding-tmux-soak.sh drive-long-output
 
-OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+OCTOSCODE_SOAK_RUN_ID=<run-id> \
 scripts/run-onboarding-tmux-soak.sh verify-long-output
 ```
 
@@ -600,10 +600,10 @@ transcript.
 For narrow-terminal evidence:
 
 ```sh
-OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+OCTOSCODE_SOAK_RUN_ID=<run-id> \
 scripts/run-onboarding-tmux-soak.sh drive-narrow-terminal
 
-OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+OCTOSCODE_SOAK_RUN_ID=<run-id> \
 scripts/run-onboarding-tmux-soak.sh verify-narrow-terminal
 ```
 
@@ -618,10 +618,10 @@ overlap, leaked markdown markers, and stale running state.
 For diff/artifact readiness evidence:
 
 ```sh
-OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+OCTOSCODE_SOAK_RUN_ID=<run-id> \
 scripts/run-onboarding-tmux-soak.sh drive-diff-artifact
 
-OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+OCTOSCODE_SOAK_RUN_ID=<run-id> \
 scripts/run-onboarding-tmux-soak.sh verify-diff-artifact
 ```
 
@@ -636,10 +636,10 @@ transcript.
 For denied-tool / blocked-policy evidence:
 
 ```sh
-OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+OCTOSCODE_SOAK_RUN_ID=<run-id> \
 scripts/run-onboarding-tmux-soak.sh drive-tool-denial
 
-OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+OCTOSCODE_SOAK_RUN_ID=<run-id> \
 scripts/run-onboarding-tmux-soak.sh verify-tool-denial
 ```
 
@@ -653,10 +653,10 @@ and no `approval/requested` frame for that retained bundle.
 For normal successful tool-call evidence:
 
 ```sh
-OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+OCTOSCODE_SOAK_RUN_ID=<run-id> \
 scripts/run-onboarding-tmux-soak.sh drive-tool-success
 
-OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+OCTOSCODE_SOAK_RUN_ID=<run-id> \
 scripts/run-onboarding-tmux-soak.sh verify-tool-success
 ```
 
@@ -667,11 +667,11 @@ and no denied-tool event in that retained bundle.
 
 ## M19 UX Run Bundle
 
-For M19 runner-owned artifacts, set `OCTOS_TUI_SOAK_ARTIFACT_DIR` to the
+For M19 runner-owned artifacts, set `OCTOSCODE_SOAK_ARTIFACT_DIR` to the
 scenario directory and run:
 
 ```sh
-OCTOS_TUI_SOAK_ARTIFACT_DIR=e2e/test-results-ux/<run-id>/<scenario-id> \
+OCTOSCODE_SOAK_ARTIFACT_DIR=e2e/test-results-ux/<run-id>/<scenario-id> \
 scripts/run-onboarding-tmux-soak.sh verify-ux-run
 ```
 
@@ -687,7 +687,7 @@ The solo lane writes these M12 artifacts into
 
 - `tui-capture.txt`
 - `tui-capture-first-launch.txt` when
-  `OCTOS_TUI_SOAK_FIRST_LAUNCH_CAPTURE=1`
+  `OCTOSCODE_SOAK_FIRST_LAUNCH_CAPTURE=1`
 - `tui-capture-provider-missing.txt` when running `drive-provider-missing`
 - `tui-capture-permissions-open.txt` and
   `tui-capture-permissions-applied.txt` when running `drive-permissions`
@@ -731,10 +731,10 @@ method names remain visible; the verifier fails if `auth/send_code` or
 On 249/mini hosts, pin the run id, port, and artifact root:
 
 ```sh
-OCTOS_TUI_SOAK_RUN_ID="$(hostname)-solo-$(date -u +%Y%m%dT%H%M%SZ)" \
-OCTOS_TUI_SOAK_PORT=50249 \
-OCTOS_TUI_SOAK_ARTIFACT_ROOT="$PWD/e2e/test-results-tui-onboarding" \
-OCTOS_TUI_SOAK_TRANSPORT=stdio \
+OCTOSCODE_SOAK_RUN_ID="$(hostname)-solo-$(date -u +%Y%m%dT%H%M%SZ)" \
+OCTOSCODE_SOAK_PORT=50249 \
+OCTOSCODE_SOAK_ARTIFACT_ROOT="$PWD/e2e/test-results-tui-onboarding" \
+OCTOSCODE_SOAK_TRANSPORT=stdio \
   scripts/run-onboarding-tmux-soak.sh drive-solo
 ```
 
@@ -769,7 +769,7 @@ Then complete the guided wizard:
 For deterministic local smoke without hand typing:
 
 ```sh
-OCTOS_TUI_SOAK_API_KEY=<secret-value> \
+OCTOSCODE_SOAK_API_KEY=<secret-value> \
 scripts/run-onboarding-tmux-soak.sh drive-onboard
 ```
 
@@ -784,10 +784,10 @@ For M12 runtime-cockpit evidence, capture the server-backed status, model, and
 MCP menu surfaces:
 
 ```sh
-OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+OCTOSCODE_SOAK_RUN_ID=<run-id> \
 scripts/run-onboarding-tmux-soak.sh drive-runtime-menus
 
-OCTOS_TUI_SOAK_RUN_ID=<run-id> \
+OCTOSCODE_SOAK_RUN_ID=<run-id> \
 scripts/run-onboarding-tmux-soak.sh verify-runtime-menus
 ```
 
@@ -803,33 +803,33 @@ because the TUI rendered local placeholder text.
 For Moonshot AutoDL:
 
 ```sh
-OCTOS_TUI_SOAK_RUN_ID=<run-id> \
-OCTOS_TUI_SOAK_EXPECT_FAMILY=moonshot \
-OCTOS_TUI_SOAK_EXPECT_MODEL=kimi-k2.5 \
-OCTOS_TUI_SOAK_EXPECT_ROUTE=autodl \
-OCTOS_TUI_SOAK_EXPECT_BASE_URL=https://www.autodl.art/api/v1 \
+OCTOSCODE_SOAK_RUN_ID=<run-id> \
+OCTOSCODE_SOAK_EXPECT_FAMILY=moonshot \
+OCTOSCODE_SOAK_EXPECT_MODEL=kimi-k2.5 \
+OCTOSCODE_SOAK_EXPECT_ROUTE=autodl \
+OCTOSCODE_SOAK_EXPECT_BASE_URL=https://www.autodl.art/api/v1 \
 scripts/run-onboarding-tmux-soak.sh verify-onboard
 ```
 
 For MiniMax WiseModel:
 
 ```sh
-OCTOS_TUI_SOAK_RUN_ID=<run-id> \
-OCTOS_TUI_SOAK_EXPECT_FAMILY=minimax \
-OCTOS_TUI_SOAK_EXPECT_MODEL=MiniMax-M2.5-highspeed \
-OCTOS_TUI_SOAK_EXPECT_ROUTE=wisemodel \
-OCTOS_TUI_SOAK_EXPECT_BASE_URL=https://open.ospreyai.cn/v1 \
+OCTOSCODE_SOAK_RUN_ID=<run-id> \
+OCTOSCODE_SOAK_EXPECT_FAMILY=minimax \
+OCTOSCODE_SOAK_EXPECT_MODEL=MiniMax-M2.5-highspeed \
+OCTOSCODE_SOAK_EXPECT_ROUTE=wisemodel \
+OCTOSCODE_SOAK_EXPECT_BASE_URL=https://open.ospreyai.cn/v1 \
 scripts/run-onboarding-tmux-soak.sh verify-onboard
 ```
 
 For a custom OpenAI-compatible route:
 
 ```sh
-OCTOS_TUI_SOAK_RUN_ID=<run-id> \
-OCTOS_TUI_SOAK_EXPECT_FAMILY=<custom-family-id> \
-OCTOS_TUI_SOAK_EXPECT_MODEL=<custom-model-id> \
-OCTOS_TUI_SOAK_EXPECT_ROUTE=<custom-route-id> \
-OCTOS_TUI_SOAK_EXPECT_BASE_URL=<custom-base-url> \
+OCTOSCODE_SOAK_RUN_ID=<run-id> \
+OCTOSCODE_SOAK_EXPECT_FAMILY=<custom-family-id> \
+OCTOSCODE_SOAK_EXPECT_MODEL=<custom-model-id> \
+OCTOSCODE_SOAK_EXPECT_ROUTE=<custom-route-id> \
+OCTOSCODE_SOAK_EXPECT_BASE_URL=<custom-base-url> \
 scripts/run-onboarding-tmux-soak.sh verify-onboard
 ```
 
@@ -838,7 +838,7 @@ scripts/run-onboarding-tmux-soak.sh verify-onboard
 To check secret redaction, pass the test key as an environment variable only:
 
 ```sh
-OCTOS_TUI_SOAK_API_KEY=<secret-value> scripts/run-onboarding-tmux-soak.sh verify-onboard
+OCTOSCODE_SOAK_API_KEY=<secret-value> scripts/run-onboarding-tmux-soak.sh verify-onboard
 ```
 
 The verifier fails if that value appears in any retained evidence artifact
@@ -847,7 +847,7 @@ check. Raw backend state under the run data directory is not treated as retained
 evidence because it may legitimately contain the provider secret while the live
 server is running. If a run is only validating captures and no profile file is
 expected, set
-`OCTOS_TUI_SOAK_REQUIRE_PROFILE=0`; provider expectation variables still require
+`OCTOSCODE_SOAK_REQUIRE_PROFILE=0`; provider expectation variables still require
 profile JSON.
 
 Each verifier writes `ux-validation.json` with the run id, scenario, transport,
@@ -855,12 +855,12 @@ artifact directory, source checkout commits, status, and timestamp. Treat it as
 the machine-readable summary for the retained pane captures and JSONL evidence;
 keep `soak-summary.json` for provider/profile-specific details.
 `summary.env` records the run id, transport, runtime paths, and the source
-checkout commits for both `octos` and `octos-tui`.
+checkout commits for both `octos` and `octoscode`.
 Strict closure verifiers fail unless each retained closure artifact directory
-has valid `octos_repo_commit` and `octos_tui_repo_commit` fields.
+has valid `octos_repo_commit` and `octoscode_repo_commit` fields.
 They also reject mixed-revision closure bundles; old-server fallback artifacts
 may use a different `octos` backend commit, but must still use the same
-`octos-tui` commit as the closure run under test.
+`octoscode` commit as the closure run under test.
 Strict closure verifiers also require the primary closure artifact directory to
 retain a passed, provider-backed `live-preflight.json`.
 

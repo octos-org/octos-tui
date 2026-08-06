@@ -8,7 +8,7 @@ estimate: 1.5d
 
 ## 意图
 
-herdr 的 Navigator 对 octos-tui 最有价值的点不是 server/client multiplexer，
+herdr 的 Navigator 对 octoscode 最有价值的点不是 server/client multiplexer，
 而是一个可搜索、可过滤、可看 detail 的活动导航面。我们现有 inspector 是固定
 三列静态列表：sessions/tasks/artifacts + transcript + plan/workspace/git；它能
 查看状态，但不能按 `running/blocked/failed/done` 聚合，也不能跨 session 搜索。

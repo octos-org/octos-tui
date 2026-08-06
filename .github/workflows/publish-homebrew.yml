@@ -1,6 +1,6 @@
 name: Publish Homebrew Formula
-# The octos-tui Homebrew formula lives IN THIS REPO at Formula/octos-tui.rb
-# (this repo is its own tap -> `brew tap octos-org/octos-tui https://github.com/octos-org/octos-tui`).
+# The octoscode Homebrew formula lives IN THIS REPO at Formula/octoscode.rb
+# (this repo is its own tap -> `brew tap octos-org/octoscode https://github.com/octos-org/octoscode`).
 #
 # This is a STANDALONE workflow triggered by the same version tag push that
 # starts release.yml — NOT a dist custom publish job and NOT `release: published`:
@@ -17,14 +17,14 @@ name: Publish Homebrew Formula
 # (main is NOT branch-protected). GITHUB_TOKEN only.
 #
 # TWO-CHANNEL scheme (mirrors dist-workspace.toml + release.yml's npm publish):
-#   - STABLE tag (no '-'): render Formula/octos-tui.rb (class OctosTui) from
-#     packaging/homebrew/octos-tui.rb — the stable channel, unchanged.
+#   - STABLE tag (no '-'): render Formula/octoscode.rb (class Octoscode) from
+#     packaging/homebrew/octoscode.rb — the stable channel, unchanged.
 #   - PRERELEASE tag (has a '-', e.g. v0.2.2-rc.15): render the SEPARATE
-#     Formula/octos-tui-dev.rb (class OctosTuiDev) from
-#     packaging/homebrew/octos-tui-dev.rb, pointed at the prerelease assets.
-# A prerelease NEVER touches the stable Formula/octos-tui.rb, so
-# `brew install octos-org/octos-tui/octos-tui` stays STABLE while
-# `brew install octos-org/octos-tui/octos-tui-dev` tracks the latest prerelease.
+#     Formula/octoscode-dev.rb (class OctoscodeDev) from
+#     packaging/homebrew/octoscode-dev.rb, pointed at the prerelease assets.
+# A prerelease NEVER touches the stable Formula/octoscode.rb, so
+# `brew install octos-org/octoscode/octoscode` stays STABLE while
+# `brew install octos-org/octoscode/octoscode-dev` tracks the latest prerelease.
 
 on:
   push:
@@ -55,18 +55,18 @@ jobs:
           # SEPARATE dev formula; otherwise render the stable formula. Either
           # way we render + commit (no more skipping) so both channels stay live.
           if [[ "$TAG" == *-* ]]; then
-            echo "::notice::$TAG is a prerelease — rendering the dev formula (octos-tui-dev); stable octos-tui is untouched."
+            echo "::notice::$TAG is a prerelease — rendering the dev formula (octoscode-dev); stable octoscode is untouched."
             {
               echo "channel=prerelease"
-              echo "formula_file=Formula/octos-tui-dev.rb"
-              echo "template_file=packaging/homebrew/octos-tui-dev.rb"
+              echo "formula_file=Formula/octoscode-dev.rb"
+              echo "template_file=packaging/homebrew/octoscode-dev.rb"
             } >> "$GITHUB_OUTPUT"
           else
-            echo "::notice::$TAG is a stable release — rendering the stable formula (octos-tui)."
+            echo "::notice::$TAG is a stable release — rendering the stable formula (octoscode)."
             {
               echo "channel=stable"
-              echo "formula_file=Formula/octos-tui.rb"
-              echo "template_file=packaging/homebrew/octos-tui.rb"
+              echo "formula_file=Formula/octoscode.rb"
+              echo "template_file=packaging/homebrew/octoscode.rb"
             } >> "$GITHUB_OUTPUT"
           fi
 
@@ -85,7 +85,7 @@ jobs:
           for attempt in $(seq 1 60); do
             missing=0
             for triple in $triples; do
-              asset="octos-tui-${triple}.tar.xz"
+              asset="octoscode-${triple}.tar.xz"
               [ -f "artifacts/$asset" ] && continue
               gh release download "$TAG" --repo "${{ github.repository }}" \
                 --pattern "$asset" --dir artifacts 2>/dev/null || true
@@ -96,24 +96,24 @@ jobs:
             sleep 30
           done
           for triple in $triples; do
-            test -f "artifacts/octos-tui-${triple}.tar.xz" \
-              || { echo "::error::missing octos-tui-${triple}.tar.xz after wait (did release.yml fail?)"; exit 1; }
+            test -f "artifacts/octoscode-${triple}.tar.xz" \
+              || { echo "::error::missing octoscode-${triple}.tar.xz after wait (did release.yml fail?)"; exit 1; }
           done
           ls -la artifacts
 
       - name: Render formula and commit to main
         env:
           # The channel-specific source template and destination formula, chosen
-          # by the gate above (stable -> octos-tui, prerelease -> octos-tui-dev).
+          # by the gate above (stable -> octoscode, prerelease -> octoscode-dev).
           TEMPLATE_FILE: ${{ steps.gate.outputs.template_file }}
           FORMULA_FILE: ${{ steps.gate.outputs.formula_file }}
           CHANNEL: ${{ steps.gate.outputs.channel }}
         run: |
           set -euo pipefail
           version="${TAG#v}"
-          sha_darwin_arm=$(sha256sum artifacts/octos-tui-aarch64-apple-darwin.tar.xz | awk '{print $1}')
-          sha_linux_arm=$(sha256sum artifacts/octos-tui-aarch64-unknown-linux-gnu.tar.xz | awk '{print $1}')
-          sha_linux_x64=$(sha256sum artifacts/octos-tui-x86_64-unknown-linux-gnu.tar.xz | awk '{print $1}')
+          sha_darwin_arm=$(sha256sum artifacts/octoscode-aarch64-apple-darwin.tar.xz | awk '{print $1}')
+          sha_linux_arm=$(sha256sum artifacts/octoscode-aarch64-unknown-linux-gnu.tar.xz | awk '{print $1}')
+          sha_linux_x64=$(sha256sum artifacts/octoscode-x86_64-unknown-linux-gnu.tar.xz | awk '{print $1}')
 
           mkdir -p Formula
           cp "$TEMPLATE_FILE" "$FORMULA_FILE"
@@ -129,7 +129,7 @@ jobs:
           # `git diff` reports TRACKED files only, so a formula that has never
           # been committed reads as "unchanged" and this step silently no-ops
           # while still reporting success. That is exactly the prerelease
-          # channel: Formula/octos-tui-dev.rb has never existed, so every RC
+          # channel: Formula/octoscode-dev.rb has never existed, so every RC
           # tag since the two-channel scheme landed rendered it and threw it
           # away. Stage first and diff the INDEX, which sees an add as a change.
           git add -- "$FORMULA_FILE"
@@ -146,10 +146,10 @@ jobs:
           BRANCH="homebrew/${TAG}-${CHANNEL}"
           git checkout -b "$BRANCH"
           git add "$FORMULA_FILE"
-          git commit -m "octos-tui ${TAG}: update Homebrew formula (${CHANNEL})"
+          git commit -m "octoscode ${TAG}: update Homebrew formula (${CHANNEL})"
           git push -f origin "$BRANCH"
           gh pr create --base main --head "$BRANCH" \
-            --title "octos-tui ${TAG}: update Homebrew formula (${CHANNEL})" \
+            --title "octoscode ${TAG}: update Homebrew formula (${CHANNEL})" \
             --body "Automated Homebrew formula bump for ${TAG} (${CHANNEL} channel)."
           # Mergeability is computed async — retry once after a short wait.
           gh pr merge "$BRANCH" --squash --delete-branch \

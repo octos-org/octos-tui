@@ -9,7 +9,7 @@ estimate: 0.5d
 ## 意图
 
 herdr 的 scrollbar 值得借鉴的是"先用纯函数算可视模型，再渲染"这个局部模式，
-不是它的 PTY/multiplexer 架构。octos-tui 的 transcript pager 运行在
+不是它的 PTY/multiplexer 架构。octoscode 的 transcript pager 运行在
 alt-screen，终端原生 scrollback 不可见；已有状态行能提示"回看中"，但缺少
 直观的位置感。本任务给 pager 增加一个轻量可视位置条，并把滚动条 thumb 的
 几何计算抽成纯函数，便于契约测试和后续鼠标 hit-testing。

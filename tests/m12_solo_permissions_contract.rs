@@ -1,4 +1,4 @@
-use octos_tui::model::{SessionRuntimeStatus, SessionStatusReadResult};
+use octoscode::model::{SessionRuntimeStatus, SessionStatusReadResult};
 use serde_json::Value;
 
 #[test]

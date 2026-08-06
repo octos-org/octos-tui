@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # #407 Peer TUI soak — live tmux UX test for the peer dock.
 #
-# Drives a real octos-tui against a real octos serve, stages peers via
+# Drives a real octoscode against a real octos serve, stages peers via
 # peer_handoff (or /peer --prepare), and asserts:
 #   - peer chip appears in the session strip
 #   - overflow shows the structured "Peers: N · M live · K⚠" pill
@@ -13,7 +13,7 @@
 set -euo pipefail
 
 OCTOS_BIN="${OCTOS_BIN:-/Users/yuechen/home/octos-one/octos/target/debug/octos}"
-OCTOS_TUI_BIN="${OCTOS_TUI_BIN:-/Users/yuechen/home/octos-tui-wt-bashcard/target/debug/octos-tui}"
+OCTOSCODE_BIN="${OCTOSCODE_BIN:-/Users/yuechen/home/octoscode-wt-bashcard/target/debug/octoscode}"
 
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 ROOT="/tmp/octos-peer-soak-$RUN_ID"
@@ -91,9 +91,9 @@ trap teardown EXIT
 
 echo "=== binaries ==="
 [ -x "$OCTOS_BIN" ] || die "octos binary missing: $OCTOS_BIN"
-[ -x "$OCTOS_TUI_BIN" ] || die "octos-tui binary missing: $OCTOS_TUI_BIN"
+[ -x "$OCTOSCODE_BIN" ] || die "octoscode binary missing: $OCTOSCODE_BIN"
 "$OCTOS_BIN" --version | head -1
-"$OCTOS_TUI_BIN" --version | head -1
+"$OCTOSCODE_BIN" --version | head -1
 
 echo "=== launching octos serve (ws on $PORT) ==="
 # OCTOS_HOME=~/.crew resolves the 'dev' profile (LLM creds). A SEPARATE
@@ -115,9 +115,9 @@ done
 grep -qE "listening|ready|serving|bound|accepting|octos API server" "$LOGS_DIR/server.log" 2>/dev/null || \
   { echo "server log head:"; head -40 "$LOGS_DIR/server.log"; die "server did not become ready"; }
 
-echo "=== launching octos-tui (ws transport) ==="
+echo "=== launching octoscode (ws transport) ==="
 tmux new-session -d -s "$TUI_SESSION" \
-  "cd '$WORKSPACE' && '$OCTOS_TUI_BIN' \
+  "cd '$WORKSPACE' && '$OCTOSCODE_BIN' \
     --endpoint '$ENDPOINT' --auth-token '$AUTH_TOKEN' \
     --profile-id '$PROFILE_ID' --session '$SESSION_ID' \
     --cwd '$WORKSPACE' --theme codex \

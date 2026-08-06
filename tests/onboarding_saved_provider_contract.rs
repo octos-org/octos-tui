@@ -9,14 +9,14 @@
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use octos_core::ui_protocol::UiProtocolCapabilities;
-use octos_tui::client_event::{CapabilitiesClientEvent, ClientEvent, ProfileLlmListClientEvent};
-use octos_tui::event_loop::{KeyAction, handle_terminal_event};
-use octos_tui::menu::MenuBuildResult;
-use octos_tui::model::{
+use octoscode::client_event::{CapabilitiesClientEvent, ClientEvent, ProfileLlmListClientEvent};
+use octoscode::event_loop::{KeyAction, handle_terminal_event};
+use octoscode::menu::MenuBuildResult;
+use octoscode::model::{
     APPUI_METHOD_MODEL_LIST, APPUI_METHOD_PROFILE_LLM_CATALOG, APPUI_METHOD_PROFILE_LOCAL_CREATE,
     AppState, AppUiCommand, ConfigCapabilitiesListResult, ProfileLlmListResult,
 };
-use octos_tui::store::Store;
+use octoscode::store::Store;
 use serde_json::json;
 
 fn first_launch_store() -> Store {

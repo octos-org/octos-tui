@@ -1,6 +1,6 @@
 use octos_core::SessionKey;
 use octos_core::ui_protocol::SessionOpenParams;
-use octos_tui::model::{
+use octoscode::model::{
     APPUI_FEATURE_SESSION_WORKSPACE_CWD_V1, effective_workspace_root_for_display,
     scrub_session_open_cwd_for_capabilities, session_open_may_include_cwd,
 };

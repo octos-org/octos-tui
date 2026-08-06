@@ -7,9 +7,9 @@
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use octos_core::SessionKey;
-use octos_tui::event_loop::{KeyAction, handle_terminal_event};
-use octos_tui::model::{AppState, ComposerMode, FocusPane, SessionView};
-use octos_tui::store::Store;
+use octoscode::event_loop::{KeyAction, handle_terminal_event};
+use octoscode::model::{AppState, ComposerMode, FocusPane, SessionView};
+use octoscode::store::Store;
 
 fn store_with(text: &str, cursor: Option<usize>, vim: bool, mode: ComposerMode) -> Store {
     let session = SessionView {
@@ -88,7 +88,7 @@ fn vim_mode_parses_from_config_file() {
         .as_nanos();
     let path = std::env::temp_dir().join(format!("octos-vim-{nonce}.json"));
     std::fs::write(&path, r#"{ "vim-mode": true }"#).unwrap();
-    let cfg = octos_tui::cli::load_config_file(&path).expect("parses");
+    let cfg = octoscode::cli::load_config_file(&path).expect("parses");
     assert_eq!(cfg.vim_mode, Some(true));
     let _ = std::fs::remove_file(&path);
 }

@@ -17,13 +17,13 @@ use octos_core::SessionKey;
 use octos_core::app_ui::AppUiEvent;
 use octos_core::ui_protocol::{SessionOpened, UiNotification};
 
-use octos_tui::menu::CapabilitySet;
-use octos_tui::model::{
+use octoscode::menu::CapabilitySet;
+use octoscode::model::{
     APPUI_FEATURE_CODING_AUTONOMY_V1, APPUI_METHOD_AGENT_LIST, APPUI_METHOD_LOOP_LIST,
     APPUI_METHOD_SESSION_GOAL_GET, AgentListParams, AppState, AppUiCommand, LoopListParams,
     SessionGoalGetParams, SessionView,
 };
-use octos_tui::store::Store;
+use octoscode::store::Store;
 
 fn store_with_autonomy_session() -> Store {
     let session = SessionView {

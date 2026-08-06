@@ -5,7 +5,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 run_id="$(date -u +%Y%m%dT%H%M%SZ)"
-artifact_dir="${OCTOS_TUI_UX_CAPTURE_DIR:-e2e/test-results-tui-ux-capture/$run_id}"
+artifact_dir="${OCTOSCODE_UX_CAPTURE_DIR:-e2e/test-results-tui-ux-capture/$run_id}"
 fixture="fixtures/appui_ux_parity/coding_session_short.json"
 raw_capture="$artifact_dir/appui-ux-fixture.pty.txt"
 summary="$artifact_dir/summary.env"
@@ -72,7 +72,7 @@ require_marker command_output_delta '"event": "task.output_delta"'
 require_marker status_update '"event": "status.update"'
 require_marker tool_card_labels '"activity_label": "Testing"'
 
-if [[ "${OCTOS_TUI_CAPTURE_SELF_TEST:-0}" == "1" ]]; then
+if [[ "${OCTOSCODE_CAPTURE_SELF_TEST:-0}" == "1" ]]; then
   if rg -q '__octos_missing_marker_self_test__' "$fixture"; then
     emit self_test_detected_missing_marker 0
     failures=$((failures + 1))

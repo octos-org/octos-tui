@@ -387,7 +387,7 @@ impl Store {
     /// a later explicit `/onboard workspace <path>` authoritative.
     ///
     /// UX2 (#1377 follow-up): when no `--cwd` is supplied the candidate now
-    /// falls back to the process working directory (the `octos-tui --cwd`
+    /// falls back to the process working directory (the `octoscode --cwd`
     /// default the help text already documents), so the documented launch
     /// `octos serve --stdio --solo` — which carries NO `--cwd` and whose
     /// transport label resolves to `"stdio"`/empty — still validates a genuine
@@ -6170,7 +6170,7 @@ impl Store {
     /// the transport runs locally off the render loop. An empty `!` is a usage
     /// warning with no exec.
     ///
-    /// The command runs on the machine octos-tui runs on, NOT the agent's
+    /// The command runs on the machine octoscode runs on, NOT the agent's
     /// sandboxed server `shell` tool, and its output is ephemeral — shown in
     /// the chip only, never injected into the next turn's context.
     fn dispatch_bang_command(&mut self, cmd: &str) -> Option<AppUiCommand> {
@@ -10040,7 +10040,7 @@ impl Store {
 
     fn apply_notification(&mut self, notification: UiNotification) -> Option<AppUiCommand> {
         match notification {
-            // #1477 voice rich-output visual lifecycle. octos-tui does not yet
+            // #1477 voice rich-output visual lifecycle. octoscode does not yet
             // render generated visuals (a separate feature); ignore gracefully
             // so newer servers that emit these don't wedge the client.
             UiNotification::VisualGenerating(_)
@@ -25299,7 +25299,7 @@ now analyzing the bus module"
         fn new(tag: &str) -> Self {
             let mut dir = std::env::temp_dir();
             dir.push(format!(
-                "octos-tui-store-picker-{tag}-{}-{}",
+                "octoscode-store-picker-{tag}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)

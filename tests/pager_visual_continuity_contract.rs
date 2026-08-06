@@ -8,13 +8,13 @@
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use octos_core::{Message, SessionKey};
-use octos_tui::app;
-use octos_tui::cli::ThemeName;
-use octos_tui::event_loop::handle_terminal_event;
-use octos_tui::model::{AppState, SessionView};
-use octos_tui::store::Store;
-use octos_tui::theme::Palette;
-use octos_tui::tui_terminal::FrameLike;
+use octoscode::app;
+use octoscode::cli::ThemeName;
+use octoscode::event_loop::handle_terminal_event;
+use octoscode::model::{AppState, SessionView};
+use octoscode::store::Store;
+use octoscode::theme::Palette;
+use octoscode::tui_terminal::FrameLike;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::Color;

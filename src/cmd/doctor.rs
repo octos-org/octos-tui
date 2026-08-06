@@ -1,4 +1,4 @@
-//! `octos-tui doctor` — flutter-doctor-style diagnostics (design §B).
+//! `octoscode doctor` — flutter-doctor-style diagnostics (design §B).
 //!
 //! One line per check (`[✓]` pass / `[!]` warn / `[✗]` fail), grouped by
 //! category, each non-pass line followed by an indented `→ fix:` action,
@@ -9,7 +9,7 @@
 //! `[✗]`. `--strict` promotes warnings to failures.
 //!
 //! Checks implemented here:
-//! - **Binary & version**: octos-tui on PATH, install method, newer release,
+//! - **Binary & version**: octoscode on PATH, install method, newer release,
 //!   shadowing installs.
 //! - **Terminal**: TERM/terminfo, UTF-8 locale, CJK width, color support.
 //! - **Config & data**: config dir + data dir writability.
@@ -62,7 +62,7 @@ pub const TUI_REQUIRED_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
 ];
 
-/// Parsed `octos-tui doctor` flags.
+/// Parsed `octoscode doctor` flags.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DoctorArgs {
     /// Emit machine-readable JSON (support bundle).
@@ -281,7 +281,7 @@ impl Report {
                 "failures": fail,
             },
             "exit_code": self.exit_code(strict),
-            "octos_tui_version": env!("CARGO_PKG_VERSION"),
+            "octoscode_version": env!("CARGO_PKG_VERSION"),
             "octos_core_schema_version": UI_PROTOCOL_SCHEMA_VERSION,
             "octos_protocol": UI_PROTOCOL_V1,
             "platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -327,16 +327,16 @@ fn binary_checks(_args: &DoctorArgs) -> Vec<Check> {
         Some(exe) => checks.push(
             Check::pass(
                 CAT_BINARY,
-                "octos-tui binary",
+                "octoscode binary",
                 format!("v{}", env!("CARGO_PKG_VERSION")),
             )
             .with_value(exe.display().to_string()),
         ),
         None => checks.push(Check::warn(
             CAT_BINARY,
-            "octos-tui binary",
+            "octoscode binary",
             "could not resolve current executable",
-            "ensure octos-tui is on a real filesystem path",
+            "ensure octoscode is on a real filesystem path",
         )),
     }
 
@@ -347,7 +347,7 @@ fn binary_checks(_args: &DoctorArgs) -> Vec<Check> {
     // PATH resolvability + shadowing installs. We track `$PATH` resolutions
     // separately from extra known-install prefixes so "on PATH" reflects what
     // can actually be run *by name*, not merely what exists on disk.
-    let located = locate_octos_tui();
+    let located = locate_octoscode();
     checks.push(on_path_check(&located, current_exe.as_deref(), &method));
     checks.push(shadow_check(&located, &method));
 
@@ -357,7 +357,7 @@ fn binary_checks(_args: &DoctorArgs) -> Vec<Check> {
     checks
 }
 
-/// `octos-tui` binaries discovered on the host, with `$PATH` hits tracked
+/// `octoscode` binaries discovered on the host, with `$PATH` hits tracked
 /// separately from extra known-install prefixes (cargo bin, brew, …) that may
 /// not be on `$PATH`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -377,7 +377,7 @@ impl LocatedBinaries {
     }
 }
 
-/// Whether `octos-tui` is runnable by bare name (`$PATH`-resolvable). When the
+/// Whether `octoscode` is runnable by bare name (`$PATH`-resolvable). When the
 /// running executable's directory is not on `$PATH`, warn that it was launched
 /// by path and won't be found by name — folding the cargo-bin/brew prefixes in
 /// would mask exactly this case.
@@ -387,18 +387,18 @@ fn on_path_check(
     method: &InstallMethod,
 ) -> Check {
     if let Some(first) = located.on_path.first() {
-        return Check::pass(CAT_BINARY, "octos-tui on PATH", "resolvable by name")
+        return Check::pass(CAT_BINARY, "octoscode on PATH", "resolvable by name")
             .with_value(first.display().to_string());
     }
-    // npm global (esp. Windows): the launcher shim (octos-tui.ps1/.cmd) IS on
+    // npm global (esp. Windows): the launcher shim (octoscode.ps1/.cmd) IS on
     // PATH and runnable by name, but `current_exe()` resolves to the real binary
     // deep under `node_modules/.bin_real`, whose dir is NOT on PATH and whose
-    // basename isn't `octos-tui[.exe]` — so the PATH scan finds nothing. Don't
+    // basename isn't `octoscode[.exe]` — so the PATH scan finds nothing. Don't
     // false-warn, and never suggest adding an internal node_modules dir. (#189)
     if matches!(method, InstallMethod::Npm) {
         return Check::pass(
             CAT_BINARY,
-            "octos-tui on PATH",
+            "octoscode on PATH",
             "runnable by name via the npm global shim",
         )
         .with_value(
@@ -411,15 +411,15 @@ fn on_path_check(
     match current_exe.and_then(|e| e.parent()) {
         Some(dir) => Check::warn(
             CAT_BINARY,
-            "octos-tui on PATH",
-            "octos-tui isn't on $PATH — you ran it by path",
+            "octoscode on PATH",
+            "octoscode isn't on $PATH — you ran it by path",
             format!("add {} to PATH to run by name", dir.display()),
         )
         .with_value(dir.display().to_string()),
         None => Check::warn(
             CAT_BINARY,
-            "octos-tui on PATH",
-            "octos-tui not found on $PATH",
+            "octoscode on PATH",
+            "octoscode not found on $PATH",
             "add the install dir to your PATH",
         ),
     }
@@ -442,8 +442,8 @@ fn shadow_check(located: &LocatedBinaries, method: &InstallMethod) -> Check {
         0 => Check::warn(
             CAT_BINARY,
             "no shadowing installs",
-            "octos-tui not found on $PATH or known install dirs",
-            "install octos-tui or add its dir to your PATH",
+            "octoscode not found on $PATH or known install dirs",
+            "install octoscode or add its dir to your PATH",
         ),
         1 => {
             let only = &all[0];
@@ -472,7 +472,7 @@ fn shadow_check(located: &LocatedBinaries, method: &InstallMethod) -> Check {
             Check::warn(
                 CAT_BINARY,
                 "no shadowing installs",
-                format!("{n} octos-tui binaries found; first wins: {}", labelled[0]),
+                format!("{n} octoscode binaries found; first wins: {}", labelled[0]),
                 format!("remove the extras: {}", labelled[1..].join(", ")),
             )
             .with_value(labelled.join(" | "))
@@ -496,7 +496,7 @@ fn release_check(method: &InstallMethod) -> Check {
                     let fix = method
                         .upgrade_command()
                         .map(|cmd| cmd.to_string())
-                        .unwrap_or_else(|| "run `octos-tui update`".to_string());
+                        .unwrap_or_else(|| "run `octoscode update`".to_string());
                     Check::warn(
                         CAT_BINARY,
                         "up to date",
@@ -512,7 +512,7 @@ fn release_check(method: &InstallMethod) -> Check {
                     CAT_BINARY,
                     "up to date",
                     format!("could not parse versions (latest tag {})", latest.tag),
-                    "run `octos-tui update --check`",
+                    "run `octoscode update --check`",
                 ),
             }
         }
@@ -520,29 +520,29 @@ fn release_check(method: &InstallMethod) -> Check {
             CAT_BINARY,
             "up to date",
             format!("could not check GitHub for a newer release: {err}"),
-            "run `octos-tui update --check` when online",
+            "run `octoscode update --check` when online",
         ),
     }
 }
 
-/// Enumerate every `octos-tui` on `$PATH` plus known install prefixes,
+/// Enumerate every `octoscode` on `$PATH` plus known install prefixes,
 /// de-duplicated by canonical path, preserving PATH precedence (first wins).
 /// `$PATH` resolutions are tracked separately from extra known-install
 /// prefixes so the "on PATH" check reflects bare-name runnability, not mere
 /// on-disk presence (a cargo-bin install whose dir isn't on `$PATH` would
 /// otherwise be mis-reported as runnable by name).
-pub fn locate_octos_tui() -> LocatedBinaries {
+pub fn locate_octoscode() -> LocatedBinaries {
     let exe_name = if cfg!(windows) {
-        "octos-tui.exe"
+        "octoscode.exe"
     } else {
-        "octos-tui"
+        "octoscode"
     };
     locate_binary(exe_name, &default_install_dirs())
 }
 
 /// `octos` (the backend) discovered across `$PATH` + the known install prefixes,
-/// plus `~/.octos/bin` where octos-tui's auto-provisioner drops it. Same
-/// PATH-vs-off-PATH bookkeeping as [`locate_octos_tui`].
+/// plus `~/.octos/bin` where octoscode's auto-provisioner drops it. Same
+/// PATH-vs-off-PATH bookkeeping as [`locate_octoscode`].
 fn locate_octos() -> LocatedBinaries {
     let exe_name = if cfg!(windows) { "octos.exe" } else { "octos" };
     let mut dirs = default_install_dirs();
@@ -603,7 +603,7 @@ fn locate_binary(exe_name: &str, extra_dirs: &[PathBuf]) -> LocatedBinaries {
 }
 
 // ---------------------------------------------------------------------------
-// Installations (every octos-tui + octos on the machine, with versions)
+// Installations (every octoscode + octos on the machine, with versions)
 // ---------------------------------------------------------------------------
 
 const CAT_INSTALLS: &str = "Installations";
@@ -619,7 +619,7 @@ fn install_method_label(path: &Path) -> &'static str {
     } else if p.contains("/homebrew/") || p.contains("/Cellar/") || p.starts_with("/usr/local/") {
         "brew"
     } else if p.contains("/.octos/bin/") {
-        "octos-tui auto-install"
+        "octoscode auto-install"
     } else if p.contains("/.local/bin/") {
         "shell installer"
     } else if p.starts_with("/usr/bin/") || p.starts_with("/bin/") {
@@ -692,8 +692,8 @@ fn installs_check(display_name: &str, located: &LocatedBinaries) -> Check {
     }
 }
 
-/// #5: enumerate every octos-tui AND octos on the machine (across `$PATH`,
-/// Homebrew, cargo, the shell installer's `~/.local/bin`, and octos-tui's
+/// #5: enumerate every octoscode AND octos on the machine (across `$PATH`,
+/// Homebrew, cargo, the shell installer's `~/.local/bin`, and octoscode's
 /// `~/.octos/bin`), showing each copy's version + install method, plus the
 /// octos version this client needs — so duplicate/mismatched installs are
 /// visible at a glance.
@@ -701,15 +701,15 @@ fn installations_checks() -> Vec<Check> {
     vec![
         Check::pass(
             CAT_INSTALLS,
-            "octos-tui needs octos",
+            "octoscode needs octos",
             format!(
-                ">= {} (this is octos-tui v{}; auto-install bundle {})",
+                ">= {} (this is octoscode v{}; auto-install bundle {})",
                 crate::backend_ensure::MIN_OCTOS_VERSION,
                 env!("CARGO_PKG_VERSION"),
                 crate::backend_ensure::REQUIRED_OCTOS_RELEASE,
             ),
         ),
-        installs_check("octos-tui", &locate_octos_tui()),
+        installs_check("octoscode", &locate_octoscode()),
         installs_check("octos", &locate_octos()),
     ]
 }
@@ -825,7 +825,7 @@ fn locale_check(lang: Option<&str>, lc_all: Option<&str>, lc_ctype: Option<&str>
 }
 
 fn cjk_check() -> Check {
-    // Informational: octos-tui uses `unicode-width` for CJK double-width; the
+    // Informational: octoscode uses `unicode-width` for CJK double-width; the
     // visible result also depends on the terminal font, so this never fails.
     Check::pass(
         CAT_TERM,
@@ -930,7 +930,7 @@ fn writability_check(name: &'static str, dir: &Path) -> Check {
 }
 
 fn is_writable(dir: &Path) -> bool {
-    let probe = dir.join(".octos-tui-doctor-write-probe");
+    let probe = dir.join(".octoscode-doctor-write-probe");
     match std::fs::File::create(&probe) {
         Ok(_) => {
             let _ = std::fs::remove_file(&probe);
@@ -976,7 +976,7 @@ fn profiles_checks_in(data_dir: &Path) -> Vec<Check> {
             "profiles",
             "no profiles found",
             format!(
-                "run onboarding (launch octos-tui in a folder) — expected under {}",
+                "run onboarding (launch octoscode in a folder) — expected under {}",
                 profiles_dir.display()
             ),
         ));
@@ -1311,7 +1311,7 @@ const WS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// non-conforming endpoint that streams unrelated notifications could keep
 /// the probe alive forever without this.
 const WS_PROBE_OVERALL_TIMEOUT: Duration = Duration::from_secs(10);
-const WS_PROBE_ID: &str = "octos-tui-doctor-capabilities";
+const WS_PROBE_ID: &str = "octoscode-doctor-capabilities";
 
 fn probe_ws_capabilities(
     endpoint: &str,
@@ -1477,7 +1477,7 @@ fn protocol_skew_check() -> Check {
                 "TUI requires features absent from its octos-core build: {}",
                 unknown.join(", ")
             ),
-            "re-pin octos-tui's octos-core revision to one that defines these features",
+            "re-pin octoscode's octos-core revision to one that defines these features",
         )
     }
 }
@@ -1552,7 +1552,7 @@ fn network_checks() -> Vec<Check> {
             CAT_NETWORK,
             "GitHub reachable",
             "api.github.com rate-limited (HTTP 403)",
-            "set OCTOS_TUI_GITHUB_TOKEN to raise the rate limit",
+            "set OCTOSCODE_GITHUB_TOKEN to raise the rate limit",
         ),
         Reachability::Unreachable(err) => Check::warn(
             CAT_NETWORK,
@@ -1870,7 +1870,7 @@ mod tests {
         let report = Report::new(vec![Check::pass("c", "n", "d")]);
         let json = report.to_json(false);
         assert_eq!(json["summary"]["passed"], 1);
-        assert_eq!(json["octos_tui_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(json["octoscode_version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(
             json["octos_core_schema_version"],
             UI_PROTOCOL_SCHEMA_VERSION
@@ -1885,21 +1885,21 @@ mod tests {
             "cargo"
         );
         assert_eq!(
-            install_method_label(Path::new("/opt/homebrew/bin/octos-tui")),
+            install_method_label(Path::new("/opt/homebrew/bin/octoscode")),
             "brew"
         );
         assert_eq!(
-            install_method_label(Path::new("/home/u/.local/bin/octos-tui")),
+            install_method_label(Path::new("/home/u/.local/bin/octoscode")),
             "shell installer"
         );
         assert_eq!(
             install_method_label(Path::new("/home/u/.octos/bin/octos")),
-            "octos-tui auto-install"
+            "octoscode auto-install"
         );
         assert_eq!(install_method_label(Path::new("/usr/bin/octos")), "system");
         assert_eq!(
             install_method_label(Path::new(
-                "/x/node_modules/@octos-org/octos-tui/.bin_real/octos-tui"
+                "/x/node_modules/@octos-org/octoscode/.bin_real/octoscode"
             )),
             "npm"
         );
@@ -1940,7 +1940,7 @@ mod tests {
         let checks = installations_checks();
         let needs = checks
             .iter()
-            .find(|c| c.name == "octos-tui needs octos")
+            .find(|c| c.name == "octoscode needs octos")
             .expect("required-octos row present");
         assert!(
             needs
@@ -1948,7 +1948,7 @@ mod tests {
                 .contains(crate::backend_ensure::MIN_OCTOS_VERSION)
         );
         // Both binaries get an install-summary row.
-        assert!(checks.iter().any(|c| c.name == "octos-tui installs"));
+        assert!(checks.iter().any(|c| c.name == "octoscode installs"));
         assert!(checks.iter().any(|c| c.name == "octos installs"));
     }
 
@@ -1956,7 +1956,7 @@ mod tests {
     fn shadow_check_passes_for_single_and_warns_for_multiple() {
         let one = shadow_check(
             &LocatedBinaries {
-                on_path: vec![PathBuf::from("/usr/local/bin/octos-tui")],
+                on_path: vec![PathBuf::from("/usr/local/bin/octoscode")],
                 off_path: vec![],
             },
             &InstallMethod::Homebrew,
@@ -1966,15 +1966,15 @@ mod tests {
 
         let two = shadow_check(
             &LocatedBinaries {
-                on_path: vec![PathBuf::from("/opt/homebrew/bin/octos-tui")],
-                off_path: vec![PathBuf::from("/home/u/.cargo/bin/octos-tui")],
+                on_path: vec![PathBuf::from("/opt/homebrew/bin/octoscode")],
+                off_path: vec![PathBuf::from("/home/u/.cargo/bin/octoscode")],
             },
             &InstallMethod::Homebrew,
         );
         assert_eq!(two.status, CheckStatus::Warn);
-        assert!(two.detail.contains("2 octos-tui binaries"));
+        assert!(two.detail.contains("2 octoscode binaries"));
         let fix = two.fix.unwrap();
-        assert!(fix.contains(".cargo/bin/octos-tui"));
+        assert!(fix.contains(".cargo/bin/octoscode"));
         // The two locations are labelled by where they were found.
         assert!(fix.contains("[known-dir]") || two.detail.contains("[PATH]"));
     }
@@ -1987,12 +1987,12 @@ mod tests {
 
     #[test]
     fn npm_install_does_not_false_warn_on_path_or_shadow() {
-        // #189: npm-global (esp. Windows) — the locator finds no `octos-tui`
+        // #189: npm-global (esp. Windows) — the locator finds no `octoscode`
         // on PATH (the shim is .ps1/.cmd; the real .exe is under
         // node_modules/.bin_real). Both checks must PASS, not warn.
         let located = LocatedBinaries::default();
         let exe = PathBuf::from(
-            "C:/Users/u/AppData/Roaming/npm/node_modules/@octos-org/octos-tui/node_modules/.bin_real/octos-tui.exe",
+            "C:/Users/u/AppData/Roaming/npm/node_modules/@octos-org/octoscode/node_modules/.bin_real/octoscode.exe",
         );
         let on_path = on_path_check(&located, Some(exe.as_path()), &InstallMethod::Npm);
         assert_eq!(on_path.status, CheckStatus::Pass);
@@ -2009,12 +2009,12 @@ mod tests {
     #[test]
     fn on_path_check_passes_when_resolvable_by_name() {
         let located = LocatedBinaries {
-            on_path: vec![PathBuf::from("/usr/local/bin/octos-tui")],
+            on_path: vec![PathBuf::from("/usr/local/bin/octoscode")],
             off_path: vec![],
         };
         let check = on_path_check(
             &located,
-            Some(Path::new("/usr/local/bin/octos-tui")),
+            Some(Path::new("/usr/local/bin/octoscode")),
             &InstallMethod::Homebrew,
         );
         assert_eq!(check.status, CheckStatus::Pass);
@@ -2022,14 +2022,14 @@ mod tests {
 
     #[test]
     fn on_path_check_warns_when_ran_by_abs_path_and_dir_not_on_path() {
-        // Finding #1: running `~/.cargo/bin/octos-tui doctor` while
+        // Finding #1: running `~/.cargo/bin/octoscode doctor` while
         // `~/.cargo/bin` is NOT on $PATH must WARN that it isn't runnable by
         // name — not pass because the binary merely exists in a known dir.
         let located = LocatedBinaries {
             on_path: vec![],
-            off_path: vec![PathBuf::from("/home/u/.cargo/bin/octos-tui")],
+            off_path: vec![PathBuf::from("/home/u/.cargo/bin/octoscode")],
         };
-        let exe = PathBuf::from("/home/u/.cargo/bin/octos-tui");
+        let exe = PathBuf::from("/home/u/.cargo/bin/octoscode");
         let check = on_path_check(&located, Some(&exe), &InstallMethod::CargoGit);
         assert_eq!(check.status, CheckStatus::Warn);
         assert!(check.detail.contains("isn't on $PATH"));
@@ -2158,7 +2158,7 @@ mod tests {
 
     #[test]
     fn writability_check_warns_for_missing_dir() {
-        let missing = std::env::temp_dir().join("octos-tui-doctor-nope-xyz-12345");
+        let missing = std::env::temp_dir().join("octoscode-doctor-nope-xyz-12345");
         let _ = std::fs::remove_dir_all(&missing);
         let check = writability_check("missing", &missing);
         assert_eq!(check.status, CheckStatus::Warn);
@@ -2171,7 +2171,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         // Finding #4: a non-executable file on PATH must not count as a match,
         // since launching it would fail with EACCES.
-        let base = std::env::temp_dir().join("octos-tui-doctor-exec-probe-13579");
+        let base = std::env::temp_dir().join("octoscode-doctor-exec-probe-13579");
         let _ = std::fs::remove_file(&base);
         std::fs::write(&base, b"#!/bin/sh\n").expect("create probe");
 
@@ -2191,7 +2191,7 @@ mod tests {
 
     #[test]
     fn is_executable_file_rejects_directory_and_missing() {
-        let missing = std::env::temp_dir().join("octos-tui-doctor-exec-missing-24680");
+        let missing = std::env::temp_dir().join("octoscode-doctor-exec-missing-24680");
         let _ = std::fs::remove_file(&missing);
         assert!(!is_executable_file(&missing));
         // A directory is not a runnable file even though it "exists".
@@ -2274,7 +2274,7 @@ mod tests {
         // A path that exists as a regular file must NOT report "does not exist
         // yet (mkdir -p)" — `mkdir -p` would fail. It is a [✗] failure with a
         // remove/relocate fix (finding #3).
-        let file = std::env::temp_dir().join("octos-tui-doctor-datadir-as-file-98765");
+        let file = std::env::temp_dir().join("octoscode-doctor-datadir-as-file-98765");
         let _ = std::fs::remove_file(&file);
         std::fs::write(&file, b"not a dir").expect("create probe file");
         let check = writability_check("data dir", &file);
@@ -2294,7 +2294,7 @@ mod tests {
         fn new(tag: &str) -> Self {
             let mut dir = std::env::temp_dir();
             dir.push(format!(
-                "octos-tui-doctor-{tag}-{}-{:?}",
+                "octoscode-doctor-{tag}-{}-{:?}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)

@@ -1,9 +1,9 @@
 //! Contract tests for theme-following code highlighting
 //! (`specs/task-highlight-theme-follow.spec`).
 
-use octos_tui::cli::ThemeName;
-use octos_tui::highlight::highlight_block;
-use octos_tui::theme::Palette;
+use octoscode::cli::ThemeName;
+use octoscode::highlight::highlight_block;
+use octoscode::theme::Palette;
 use ratatui::style::Color;
 
 fn rust_body() -> Vec<String> {

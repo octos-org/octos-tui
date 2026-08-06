@@ -1,6 +1,6 @@
 //! Phase 3 startup profile discovery.
 //!
-//! octos-tui has no UI-protocol `profile/list` method for account/local
+//! octoscode has no UI-protocol `profile/list` method for account/local
 //! profiles, so for the solo-local use case it discovers existing profiles
 //! straight from the server's on-disk layout: `<data_dir>/profiles/<id>.json`.
 //! The data dir is resolved from the launch command — an explicit
@@ -225,7 +225,7 @@ pub fn delete_profile(data_dir: &Path, id: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Per-instance runtime data dir for a stdio serve, so multiple octos-tui
+/// Per-instance runtime data dir for a stdio serve, so multiple octoscode
 /// windows can run concurrently while sharing ONE profile registry. Passed to
 /// the spawned serve as `OCTOS_INSTANCE_DATA_DIR`; the server keeps the profile
 /// registry + catalog at the shared `state_home` and puts all exclusively-locked
@@ -235,12 +235,12 @@ pub fn delete_profile(data_dir: &Path, id: &str) -> std::io::Result<()> {
 /// carries NO explicit data-dir override (the default `~/.octos` case) — an
 /// explicit `--data-dir`/`OCTOS_HOME=` means the operator controls placement, so
 /// we never second-guess it. `None` for remote/WebSocket launches (no command),
-/// an unresolvable override, or when `OCTOS_TUI_SHARED_INSTANCE` opts out (legacy
+/// an unresolvable override, or when `OCTOSCODE_SHARED_INSTANCE` opts out (legacy
 /// single shared instance). The hash keys on the launch cwd: stable across
 /// relaunch (sessions/goals persist per project) and distinct across folders
 /// (windows in different projects run concurrently).
 pub fn instance_data_dir_for_launch(stdio_command: Option<&str>, cwd: &Path) -> Option<PathBuf> {
-    if std::env::var_os("OCTOS_TUI_SHARED_INSTANCE").is_some_and(|v| !v.is_empty()) {
+    if std::env::var_os("OCTOSCODE_SHARED_INSTANCE").is_some_and(|v| !v.is_empty()) {
         return None;
     }
     match stdio_command.map(data_dir_from_command) {
@@ -292,7 +292,7 @@ mod tests {
         fn new(tag: &str) -> Self {
             let mut dir = std::env::temp_dir();
             let unique = format!(
-                "octos-tui-profiles-{tag}-{}-{:?}",
+                "octoscode-profiles-{tag}-{}-{:?}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)

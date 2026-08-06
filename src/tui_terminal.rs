@@ -2,7 +2,7 @@
 //!
 //! # Why this exists
 //!
-//! The default `ratatui::Terminal` (and octos-tui's previous use of it inside an
+//! The default `ratatui::Terminal` (and octoscode's previous use of it inside an
 //! `EnterAlternateScreen` fullscreen buffer) repaints the *entire* screen every
 //! frame. That has two fatal consequences for a chat/agent TUI:
 //!
@@ -20,7 +20,7 @@
 //!
 //! This is a faithful but trimmed port: we keep the inline-viewport bookkeeping
 //! ([`Terminal::set_viewport_area`], the buffer diffing in [`Terminal::flush`],
-//! the cursor/clear helpers) and drop the bits octos-tui does not need for the
+//! the cursor/clear helpers) and drop the bits octoscode does not need for the
 //! first cut (Zellij raw-newline scrolling, `^Z` suspend resume, OSC-width
 //! special-casing). `unsafe_code` is denied workspace-wide, and nothing here
 //! needs it.
@@ -51,7 +51,7 @@ use ratatui::style::Modifier;
 use ratatui::widgets::Widget;
 use unicode_width::UnicodeWidthStr;
 
-/// The slice of `ratatui::Frame` that octos-tui's render code uses. Implemented
+/// The slice of `ratatui::Frame` that octoscode's render code uses. Implemented
 /// by both `ratatui::Frame` (the full-screen overlay path) and the inline
 /// [`Frame`] below (the scrollback/inline-viewport path), so the `render_*`
 /// functions in `app.rs` can be written once against `&mut impl FrameLike` and
@@ -79,7 +79,7 @@ impl FrameLike for ratatui::Frame<'_> {
 }
 
 /// A render frame handed to the inline-viewport draw closure. Mirrors the slice
-/// of `ratatui::Frame` that octos-tui's render code actually uses.
+/// of `ratatui::Frame` that octoscode's render code actually uses.
 pub struct Frame<'a> {
     pub(crate) cursor_position: Option<Position>,
     pub(crate) viewport_area: Rect,

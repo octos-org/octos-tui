@@ -7,10 +7,10 @@
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use octos_core::{Message, SessionKey};
-use octos_tui::cli::{Lang, ScrollMode, ThemeName, load_config_file, save_ui_settings};
-use octos_tui::event_loop::handle_terminal_event;
-use octos_tui::model::{AppState, SessionView};
-use octos_tui::store::Store;
+use octoscode::cli::{Lang, ScrollMode, ThemeName, load_config_file, save_ui_settings};
+use octoscode::event_loop::handle_terminal_event;
+use octoscode::model::{AppState, SessionView};
+use octoscode::store::Store;
 use std::path::PathBuf;
 
 fn chat_store() -> Store {
@@ -154,8 +154,8 @@ fn saveconfig_excludes_thinking() {
 fn default_config_path_resolves_under_config_dir() {
     // The fallback used when launched without --config: a pure, non-destructive
     // resolution (the dispatch path feeds this into the same merge writer).
-    let path = octos_tui::cli::default_config_path().expect("HOME is set in test env");
-    let suffix: std::path::PathBuf = [".config", "octos-tui", "config.json"].iter().collect();
+    let path = octoscode::cli::default_config_path().expect("HOME is set in test env");
+    let suffix: std::path::PathBuf = [".config", "octoscode", "config.json"].iter().collect();
     assert!(
         path.ends_with(&suffix),
         "default path {path:?} must end with {suffix:?}"

@@ -1,6 +1,6 @@
 # Coding UX Prompt Contract
 
-`octos-tui` must render AppUI events defensively, but some coding UX quality
+`octoscode` must render AppUI events defensively, but some coding UX quality
 depends on the agent emitting predictable human-facing text. This contract is
 intended for the Octos server profile, coding harness, or agent system prompt.
 It should not be injected by the TUI client.

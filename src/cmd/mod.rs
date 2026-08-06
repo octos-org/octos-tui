@@ -1,4 +1,4 @@
-//! `octos-tui` subcommands: `update` and `doctor` (design doc).
+//! `octoscode` subcommands: `update` and `doctor` (design doc).
 //!
 //! The TUI's CLI is a hand-rolled `Cli::parse()` with no clap subcommands, and
 //! the default no-subcommand invocation launches the TUI. To add `update` and
@@ -28,7 +28,7 @@ const SUBCOMMANDS: &[&str] = &["update", "doctor", "config"];
 /// first non-flag positional is `update`/`doctor`, run it and return its exit
 /// code; otherwise return `None` so the caller launches the TUI as before.
 ///
-/// Only a *leading* positional is treated as a subcommand: `octos-tui --lang zh`
+/// Only a *leading* positional is treated as a subcommand: `octoscode --lang zh`
 /// still launches the TUI, and a config value that happens to be "doctor" is
 /// never misread as a subcommand because we only look at the first bare token.
 pub fn dispatch<I, S>(args: I) -> Result<Option<i32>>
@@ -57,14 +57,14 @@ enum Route {
 
 /// Parse `argv` into a [`Route`] if it leads with a known subcommand; otherwise
 /// `None` (the caller launches the TUI). The synthetic program name keeps
-/// clap's usage strings accurate (e.g. `octos-tui doctor`); the subcommand
+/// clap's usage strings accurate (e.g. `octoscode doctor`); the subcommand
 /// token is dropped (`skip(2)`) so clap does not see it as a stray positional.
 fn route(argv: &[String]) -> Option<Route> {
     let first = argv.get(1)?;
     if !SUBCOMMANDS.contains(&first.as_str()) {
         return None;
     }
-    let prog = format!("octos-tui {first}");
+    let prog = format!("octoscode {first}");
     let sub_argv: Vec<String> = std::iter::once(prog)
         .chain(argv.iter().skip(2).cloned())
         .collect();
@@ -76,11 +76,11 @@ fn route(argv: &[String]) -> Option<Route> {
     }
 }
 
-/// `octos-tui update` flags.
+/// `octoscode update` flags.
 #[derive(Debug, Parser)]
 #[command(
-    name = "octos-tui update",
-    about = "Update octos-tui in place (cargo-dist installs) or print the right upgrade command"
+    name = "octoscode update",
+    about = "Update octoscode in place (cargo-dist installs) or print the right upgrade command"
 )]
 struct UpdateCli {
     /// Only report whether an update is available (exit 10 if newer).
@@ -120,11 +120,11 @@ impl UpdateCli {
     }
 }
 
-/// `octos-tui doctor` flags.
+/// `octoscode doctor` flags.
 #[derive(Debug, Parser)]
 #[command(
-    name = "octos-tui doctor",
-    about = "Diagnose octos-tui's environment, install, and protocol compatibility"
+    name = "octoscode doctor",
+    about = "Diagnose octoscode's environment, install, and protocol compatibility"
 )]
 struct DoctorCli {
     /// Emit machine-readable JSON (support bundle).
@@ -175,17 +175,17 @@ mod tests {
     #[test]
     fn route_returns_none_for_no_subcommand() {
         // Plain launch — no subcommand → TUI path.
-        assert!(route(&argv(&["octos-tui"])).is_none());
+        assert!(route(&argv(&["octoscode"])).is_none());
         // A flag-only invocation is not a subcommand.
-        assert!(route(&argv(&["octos-tui", "--lang", "zh"])).is_none());
+        assert!(route(&argv(&["octoscode", "--lang", "zh"])).is_none());
         // A non-subcommand positional also falls through.
-        assert!(route(&argv(&["octos-tui", "chat"])).is_none());
+        assert!(route(&argv(&["octoscode", "chat"])).is_none());
     }
 
     #[test]
     fn route_recognizes_update_with_flags() {
         // Routing + arg-parsing happens here; no network is performed.
-        let routed = route(&argv(&["octos-tui", "update", "--check", "--json"]));
+        let routed = route(&argv(&["octoscode", "update", "--check", "--json"]));
         match routed {
             Some(Route::Update(args)) => {
                 assert!(args.check);
@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn route_recognizes_doctor_with_flags() {
-        let routed = route(&argv(&["octos-tui", "doctor", "--strict", "--verbose"]));
+        let routed = route(&argv(&["octoscode", "doctor", "--strict", "--verbose"]));
         match routed {
             Some(Route::Doctor(args)) => {
                 assert!(args.strict);
@@ -212,7 +212,7 @@ mod tests {
         // The dedicated parser receives flags *without* the subcommand token
         // (dispatch strips it). Exercises a couple of flags route() doesn't.
         let args = DoctorCli::parse_from([
-            "octos-tui doctor",
+            "octoscode doctor",
             "--stdio-command",
             "octos serve --stdio",
             "--data-dir",
@@ -229,19 +229,19 @@ mod tests {
     #[test]
     fn route_recognizes_config_and_defaults_to_show() {
         // Bare `config` → show action (the interactive wizard was removed).
-        match route(&argv(&["octos-tui", "config"])) {
+        match route(&argv(&["octoscode", "config"])) {
             Some(Route::Config(args)) => {
                 assert!(matches!(args.action, config::ConfigAction::Show));
             }
             other => panic!("expected Route::Config, got {other:?}"),
         }
         // Explicit actions parse.
-        match route(&argv(&["octos-tui", "config", "path"])) {
+        match route(&argv(&["octoscode", "config", "path"])) {
             Some(Route::Config(args)) => assert!(matches!(args.action, config::ConfigAction::Path)),
             other => panic!("expected Route::Config(Path), got {other:?}"),
         }
         match route(&argv(&[
-            "octos-tui",
+            "octoscode",
             "config",
             "show",
             "--config",
@@ -262,7 +262,7 @@ mod tests {
     fn update_version_and_tag_conflict() {
         // Note: no subcommand token — dispatch strips it before this parser.
         let err = UpdateCli::try_parse_from([
-            "octos-tui update",
+            "octoscode update",
             "--version",
             "0.1.2",
             "--tag",

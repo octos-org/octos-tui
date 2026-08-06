@@ -5,46 +5,46 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 octos_repo="${OCTOS_REPO:-$(cd "$repo_root/../octos" 2>/dev/null && pwd || true)}"
 
-run_id="${OCTOS_TUI_M18_STDIO_RUN_ID:-m18-stdio-live-$(date -u +%Y%m%dT%H%M%SZ)}"
-artifact_root="${OCTOS_TUI_M18_STDIO_ARTIFACT_ROOT:-$repo_root/e2e/test-results-m18-stdio-live-tmux}"
-artifact_dir="${OCTOS_TUI_M18_STDIO_RUN_ARTIFACT_DIR:-$artifact_root/$run_id}"
-runtime_root="${OCTOS_TUI_M18_STDIO_RUNTIME_ROOT:-/tmp/octos-tui-m18-stdio-$run_id}"
-workspace="${OCTOS_TUI_M18_STDIO_WORKSPACE:-$runtime_root/workspace}"
-data_dir="${OCTOS_TUI_M18_STDIO_DATA_DIR:-$runtime_root/data}"
+run_id="${OCTOSCODE_M18_STDIO_RUN_ID:-m18-stdio-live-$(date -u +%Y%m%dT%H%M%SZ)}"
+artifact_root="${OCTOSCODE_M18_STDIO_ARTIFACT_ROOT:-$repo_root/e2e/test-results-m18-stdio-live-tmux}"
+artifact_dir="${OCTOSCODE_M18_STDIO_RUN_ARTIFACT_DIR:-$artifact_root/$run_id}"
+runtime_root="${OCTOSCODE_M18_STDIO_RUNTIME_ROOT:-/tmp/octoscode-m18-stdio-$run_id}"
+workspace="${OCTOSCODE_M18_STDIO_WORKSPACE:-$runtime_root/workspace}"
+data_dir="${OCTOSCODE_M18_STDIO_DATA_DIR:-$runtime_root/data}"
 octos_bin="${OCTOS_BIN:-${octos_repo:+$octos_repo/target/debug/octos}}"
-octos_tui_bin="${OCTOS_TUI_BIN:-$repo_root/target/debug/octos-tui}"
-profile_id="${OCTOS_TUI_M18_STDIO_PROFILE:-coding}"
-session_id="${OCTOS_TUI_M18_STDIO_SESSION:-$profile_id:local:m18-stdio#$run_id}"
-tmux_session="${OCTOS_TUI_M18_STDIO_TMUX_SESSION:-octos-m18-stdio-$run_id}"
-ready_wait_secs="${OCTOS_TUI_M18_STDIO_READY_WAIT_SECS:-25}"
-prompt_wait_secs="${OCTOS_TUI_M18_STDIO_PROMPT_WAIT_SECS:-45}"
-repeat_count="${OCTOS_TUI_M18_STDIO_REPEAT_COUNT:-1}"
-failure_budget="${OCTOS_TUI_M18_STDIO_FAILURE_BUDGET:-0}"
-run_command="${OCTOS_TUI_M18_STDIO_RUN_COMMAND:-}"
+octoscode_bin="${OCTOSCODE_BIN:-$repo_root/target/debug/octoscode}"
+profile_id="${OCTOSCODE_M18_STDIO_PROFILE:-coding}"
+session_id="${OCTOSCODE_M18_STDIO_SESSION:-$profile_id:local:m18-stdio#$run_id}"
+tmux_session="${OCTOSCODE_M18_STDIO_TMUX_SESSION:-octos-m18-stdio-$run_id}"
+ready_wait_secs="${OCTOSCODE_M18_STDIO_READY_WAIT_SECS:-25}"
+prompt_wait_secs="${OCTOSCODE_M18_STDIO_PROMPT_WAIT_SECS:-45}"
+repeat_count="${OCTOSCODE_M18_STDIO_REPEAT_COUNT:-1}"
+failure_budget="${OCTOSCODE_M18_STDIO_FAILURE_BUDGET:-0}"
+run_command="${OCTOSCODE_M18_STDIO_RUN_COMMAND:-}"
 
 usage() {
   cat <<'USAGE'
 Usage: scripts/run-m18-stdio-live-tmux-soak.sh <run-once|repeat|self-test|help>
 
 Commands:
-  run-once   Launch octos-tui in tmux against real `octos serve --stdio`.
-  repeat     Run run-once, or OCTOS_TUI_M18_STDIO_RUN_COMMAND, N times and write a flake-budget report.
+  run-once   Launch octoscode in tmux against real `octos serve --stdio`.
+  repeat     Run run-once, or OCTOSCODE_M18_STDIO_RUN_COMMAND, N times and write a flake-budget report.
   self-test  Exercise repeat-report accounting with synthetic child commands only.
 
 Environment:
   OCTOS_BIN                                  Backend binary. Default: ../octos/target/debug/octos.
-  OCTOS_TUI_BIN                              TUI binary. Default: target/debug/octos-tui.
-  OCTOS_TUI_M18_STDIO_REPEAT_COUNT           Repeat count for repeat. Default: 1.
-  OCTOS_TUI_M18_STDIO_FAILURE_BUDGET         Allowed failed runs before repeat exits nonzero. Default: 0.
-  OCTOS_TUI_M18_STDIO_ARTIFACT_ROOT          Report/artifact root. Default: e2e/test-results-m18-stdio-live-tmux.
-  OCTOS_TUI_M18_STDIO_RUN_COMMAND            Optional command used by repeat instead of run-once.
-  OCTOS_TUI_M18_STDIO_PROMPT                 Optional prompt to submit during run-once.
-  OCTOS_TUI_M18_STDIO_KEEP_SESSION           Set to 1 to leave tmux session running after run-once.
+  OCTOSCODE_BIN                              TUI binary. Default: target/debug/octoscode.
+  OCTOSCODE_M18_STDIO_REPEAT_COUNT           Repeat count for repeat. Default: 1.
+  OCTOSCODE_M18_STDIO_FAILURE_BUDGET         Allowed failed runs before repeat exits nonzero. Default: 0.
+  OCTOSCODE_M18_STDIO_ARTIFACT_ROOT          Report/artifact root. Default: e2e/test-results-m18-stdio-live-tmux.
+  OCTOSCODE_M18_STDIO_RUN_COMMAND            Optional command used by repeat instead of run-once.
+  OCTOSCODE_M18_STDIO_PROMPT                 Optional prompt to submit during run-once.
+  OCTOSCODE_M18_STDIO_KEEP_SESSION           Set to 1 to leave tmux session running after run-once.
 
 repeat exports these per child:
-  OCTOS_TUI_M18_STDIO_RUN_ID
-  OCTOS_TUI_M18_STDIO_RUN_INDEX
-  OCTOS_TUI_M18_STDIO_RUN_ARTIFACT_DIR
+  OCTOSCODE_M18_STDIO_RUN_ID
+  OCTOSCODE_M18_STDIO_RUN_INDEX
+  OCTOSCODE_M18_STDIO_RUN_ARTIFACT_DIR
 USAGE
 }
 
@@ -110,7 +110,7 @@ write_run_summary() {
   ended_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   cat > "$artifact_dir/run-summary.json" <<EOF
 {
-  "schema": "octos-tui-m18-stdio-live-run-v1",
+  "schema": "octoscode-m18-stdio-live-run-v1",
   "ok": $ok,
   "reason": $(json_string "$reason"),
   "run_id": $(json_string "$run_id"),
@@ -120,7 +120,7 @@ write_run_summary() {
   "profile_id": $(json_string "$profile_id"),
   "tmux_session": $(json_string "$tmux_session"),
   "octos_bin": $(json_string "$octos_bin"),
-  "octos_tui_bin": $(json_string "$octos_tui_bin"),
+  "octoscode_bin": $(json_string "$octoscode_bin"),
   "files": {
     "tui_capture": $(json_string "$artifact_dir/tui-capture.txt"),
     "server_log": $(json_string "$artifact_dir/server.log"),
@@ -133,7 +133,7 @@ EOF
 run_once() {
   command -v tmux >/dev/null 2>&1 || die "tmux is required for run-once"
   require_executable OCTOS_BIN "$octos_bin"
-  require_executable OCTOS_TUI_BIN "$octos_tui_bin"
+  require_executable OCTOSCODE_BIN "$octoscode_bin"
   if ! "$octos_bin" serve --help >/dev/null 2>&1; then
     die "OCTOS_BIN does not expose 'serve': $octos_bin"
   fi
@@ -144,7 +144,7 @@ run_once() {
   local stdio_command
   stdio_command="bash -lc $(shell_quote "exec $(shell_quote "$octos_bin") serve --stdio --data-dir $(shell_quote "$data_dir") --cwd $(shell_quote "$workspace") 2>$(shell_quote "$server_log")")"
   local tui_cmd
-  tui_cmd="cd $(shell_quote "$repo_root") && RUST_LOG=off exec $(shell_quote "$octos_tui_bin") --mode protocol --stdio-command $(shell_quote "$stdio_command") --session $(shell_quote "$session_id") --profile-id $(shell_quote "$profile_id") --cwd $(shell_quote "$workspace") 2>$(shell_quote "$tui_stderr")"
+  tui_cmd="cd $(shell_quote "$repo_root") && RUST_LOG=off exec $(shell_quote "$octoscode_bin") --mode protocol --stdio-command $(shell_quote "$stdio_command") --session $(shell_quote "$session_id") --profile-id $(shell_quote "$profile_id") --cwd $(shell_quote "$workspace") 2>$(shell_quote "$tui_stderr")"
 
   tmux kill-session -t "$tmux_session" 2>/dev/null || true
   tmux new-session -d -s "$tmux_session" "$tui_cmd"
@@ -156,9 +156,9 @@ run_once() {
     reason="timed out waiting for stdio TUI readiness"
   fi
 
-  if [ "$ok" = true ] && [ -n "${OCTOS_TUI_M18_STDIO_PROMPT:-}" ]; then
+  if [ "$ok" = true ] && [ -n "${OCTOSCODE_M18_STDIO_PROMPT:-}" ]; then
     tmux send-keys -t "$tmux_session" Escape
-    tmux send-keys -t "$tmux_session" -l "$OCTOS_TUI_M18_STDIO_PROMPT"
+    tmux send-keys -t "$tmux_session" -l "$OCTOSCODE_M18_STDIO_PROMPT"
     tmux send-keys -t "$tmux_session" Enter
     if ! wait_for_capture_text 'Done|Session Summary|turn completed|error|Error' "$prompt_wait_secs"; then
       ok=false
@@ -172,7 +172,7 @@ run_once() {
     reason="panic marker found in TUI capture or stderr"
   fi
 
-  if [ "${OCTOS_TUI_M18_STDIO_KEEP_SESSION:-0}" != "1" ]; then
+  if [ "${OCTOSCODE_M18_STDIO_KEEP_SESSION:-0}" != "1" ]; then
     tmux kill-session -t "$tmux_session" 2>/dev/null || true
   fi
 
@@ -188,12 +188,12 @@ run_once() {
 
 repeat_runs() {
   case "$repeat_count" in
-    ''|*[!0-9]*) die "OCTOS_TUI_M18_STDIO_REPEAT_COUNT must be a positive integer" ;;
+    ''|*[!0-9]*) die "OCTOSCODE_M18_STDIO_REPEAT_COUNT must be a positive integer" ;;
   esac
   case "$failure_budget" in
-    ''|*[!0-9]*) die "OCTOS_TUI_M18_STDIO_FAILURE_BUDGET must be a non-negative integer" ;;
+    ''|*[!0-9]*) die "OCTOSCODE_M18_STDIO_FAILURE_BUDGET must be a non-negative integer" ;;
   esac
-  [ "$repeat_count" -ge 1 ] || die "OCTOS_TUI_M18_STDIO_REPEAT_COUNT must be >= 1"
+  [ "$repeat_count" -ge 1 ] || die "OCTOSCODE_M18_STDIO_REPEAT_COUNT must be >= 1"
 
   mkdir -p "$artifact_root"
   local report="$artifact_root/$run_id-repeat-report.json"
@@ -226,10 +226,10 @@ repeat_runs() {
     mkdir -p "$child_dir"
     started="$(date +%s)"
     if env \
-      OCTOS_TUI_M18_STDIO_RUN_ID="$child_run_id" \
-      OCTOS_TUI_M18_STDIO_RUN_INDEX="$index" \
-      OCTOS_TUI_M18_STDIO_RUN_ARTIFACT_DIR="$child_dir" \
-      OCTOS_TUI_M18_STDIO_ARTIFACT_ROOT="$artifact_root" \
+      OCTOSCODE_M18_STDIO_RUN_ID="$child_run_id" \
+      OCTOSCODE_M18_STDIO_RUN_INDEX="$index" \
+      OCTOSCODE_M18_STDIO_RUN_ARTIFACT_DIR="$child_dir" \
+      OCTOSCODE_M18_STDIO_ARTIFACT_ROOT="$artifact_root" \
       bash -lc "$command_string" > "$child_log" 2>&1; then
       pass_count=$((pass_count + 1))
     else
@@ -265,7 +265,7 @@ EOF
 
   cat > "$report" <<EOF
 {
-  "schema": "octos-tui-m18-stdio-live-flake-budget-v1",
+  "schema": "octoscode-m18-stdio-live-flake-budget-v1",
   "ok": $ok,
   "run_id": $(json_string "$run_id"),
   "started_at": $(json_string "$started_at"),
@@ -293,13 +293,13 @@ EOF
 
 self_test() {
   local tmp_root
-  tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/octos-tui-m18-stdio-repeat.XXXXXX")"
-  local command='mkdir -p "$OCTOS_TUI_M18_STDIO_RUN_ARTIFACT_DIR"; printf "synthetic capture %s\n" "$OCTOS_TUI_M18_STDIO_RUN_INDEX" > "$OCTOS_TUI_M18_STDIO_RUN_ARTIFACT_DIR/tui-capture.txt"; if [ "$OCTOS_TUI_M18_STDIO_RUN_INDEX" = "2" ]; then exit 7; fi'
-  OCTOS_TUI_M18_STDIO_RUN_ID=selftest \
-    OCTOS_TUI_M18_STDIO_ARTIFACT_ROOT="$tmp_root" \
-    OCTOS_TUI_M18_STDIO_REPEAT_COUNT=3 \
-    OCTOS_TUI_M18_STDIO_FAILURE_BUDGET=1 \
-    OCTOS_TUI_M18_STDIO_RUN_COMMAND="$command" \
+  tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/octoscode-m18-stdio-repeat.XXXXXX")"
+  local command='mkdir -p "$OCTOSCODE_M18_STDIO_RUN_ARTIFACT_DIR"; printf "synthetic capture %s\n" "$OCTOSCODE_M18_STDIO_RUN_INDEX" > "$OCTOSCODE_M18_STDIO_RUN_ARTIFACT_DIR/tui-capture.txt"; if [ "$OCTOSCODE_M18_STDIO_RUN_INDEX" = "2" ]; then exit 7; fi'
+  OCTOSCODE_M18_STDIO_RUN_ID=selftest \
+    OCTOSCODE_M18_STDIO_ARTIFACT_ROOT="$tmp_root" \
+    OCTOSCODE_M18_STDIO_REPEAT_COUNT=3 \
+    OCTOSCODE_M18_STDIO_FAILURE_BUDGET=1 \
+    OCTOSCODE_M18_STDIO_RUN_COMMAND="$command" \
     "$0" repeat >/dev/null
 
   local report="$tmp_root/selftest-repeat-report.json"

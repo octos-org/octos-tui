@@ -8,13 +8,13 @@
 
 use octos_core::SessionKey;
 use octos_core::ui_protocol::TurnId;
-use octos_tui::client_event::ClientEvent;
-use octos_tui::menu::CapabilitySet;
-use octos_tui::model::{
+use octoscode::client_event::ClientEvent;
+use octoscode::menu::CapabilitySet;
+use octoscode::model::{
     APPUI_FEATURE_REVIEW_START_V1, APPUI_METHOD_REVIEW_START, AppState, AppUiCommand,
     ReviewStartResult, SessionView,
 };
-use octos_tui::store::Store;
+use octoscode::store::Store;
 
 fn store_with_review_capability() -> Store {
     let session = SessionView {

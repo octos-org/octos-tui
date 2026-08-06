@@ -8,7 +8,7 @@ estimate: 0.5d
 
 ## 意图
 
-octos-tui 已有状态行、pager、menu、onboarding、approval 等提示文本，但模式判断散落
+octoscode 已有状态行、pager、menu、onboarding、approval 等提示文本，但模式判断散落
 在具体渲染函数里。herdr 可借鉴的是"每个模式都有稳定、紧凑的提示条"这个局部
 UI 模式，而不是可配置 keybind 或全局 TUI 架构。本任务先把状态行末尾的 key hint
 收敛成一个纯模型，作为后续 approval/onboarding/menu 接入同一 hint-bar 组件的地基。

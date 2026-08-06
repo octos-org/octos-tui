@@ -4530,7 +4530,7 @@ fn harness_status_lines(
     let mut spans: Vec<Span<'static>> = Vec::new();
     // Water-wave gradient on "spinner + phase" (e.g. "◠ Working"): a bright crest
     // ripples across the label, advanced by the ~25ms animation redraw via the
-    // shared process clock. Uses Color::Rgb like the rest of octos-tui's themes
+    // shared process clock. Uses Color::Rgb like the rest of octoscode's themes
     // (truecolor-assuming, so it works over SSH where COLORTERM isn't forwarded);
     // the non-RGB Terminal theme degrades to a neutral-grey ripple via rgb_of.
     let label = format!("{} {}", spinner_frame(), phase);

@@ -6,7 +6,7 @@
 //! `session/goal/set`, `loop/create`, …) is wired in a later PR once
 //! the backend exposes those Octos UI methods.
 //!
-//! Contract reference: octos-tui#47 (M15-E) and upstream
+//! Contract reference: octoscode#47 (M15-E) and upstream
 //! `UPCR-2026-021` (Agent / Goal / Loop autonomy). The canonical spec
 //! lives at
 //! `octos/docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_021_AGENT_GOAL_LOOP_AUTONOMY.md`
@@ -25,7 +25,7 @@
 //! sub-menu shape sketched in #74 acceptance criterion 2) is deferred
 //! to M15-F UX work — no other autonomy slash commands have menu
 //! surfaces today, so adding one in isolation here would create an
-//! inconsistent UX. Tracking issue: octos-tui#74 (acceptance criterion
+//! inconsistent UX. Tracking issue: octoscode#74 (acceptance criterion
 //! #2 — `Add menu entries in src/menu/providers.rs`).
 
 use std::time::Duration;
