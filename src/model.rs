@@ -9316,11 +9316,23 @@ impl AppState {
         ) {
             return false;
         }
-        match self
-            .composer_paste_span
-            .take()
-            .filter(|_| self.composer_pasted)
-        {
+        // NOT `.filter(|_| self.composer_pasted)`. The gate above deliberately
+        // keys on the Collapsed PRESENTATION rather than the flag, and adding
+        // the flag back here reintroduced exactly the dependency it was written
+        // to avoid — with a worse failure than the one it guarded against.
+        //
+        // The two desync by design. `insert_pasted_text` clears `composer_pasted`
+        // for a small fragment (so a tiny burst re-opens the composer inline and
+        // echoes) while KEEPING the recorded span. But clearing the flag only
+        // re-opens content under the TYPED thresholds — 32 lines / 4000 chars,
+        // versus 4 lines / 400 for a paste. Above those, the chip stays
+        // Collapsed with a perfectly valid span and a false flag, so this filter
+        // discarded the span and fell through to `_ =>`, which clears the ENTIRE
+        // draft. A 40-line paste with typed text around it lost the lot.
+        //
+        // The span's own bounds check below is what makes dropping it safe: a
+        // stale or malformed span still falls to `_ =>`.
+        match self.composer_paste_span.take() {
             Some(span)
                 if span.start < span.end
                     && span.end <= self.composer.len()
@@ -11586,6 +11598,85 @@ mod tests {
             None,
             false,
         )
+    }
+
+    /// A large paste followed by a SMALL paste event must not destroy the draft.
+    ///
+    /// `insert_pasted_text` clears `composer_pasted` for a small fragment (so a
+    /// tiny burst re-opens the composer inline and echoes) while keeping the
+    /// recorded span. But clearing the flag only re-opens content under the
+    /// TYPED thresholds — 32 lines / 4000 chars, versus 4 lines / 400 for a
+    /// paste. Above those the chip stays Collapsed with a valid span and a
+    /// false flag.
+    ///
+    /// `take_collapsed_paste_block` used to `.filter(|_| self.composer_pasted)`,
+    /// which discarded that valid span and fell through to "clear the whole
+    /// draft". Everything the user had typed around the paste went with it.
+    #[test]
+    fn small_paste_after_a_large_one_does_not_destroy_the_surrounding_draft() {
+        let mut state = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+
+        state.insert_composer_text("before ");
+        // 40 lines: above BOTH the paste thresholds and the 32-line typed one,
+        // so it stays Collapsed even once `composer_pasted` is cleared.
+        let block = (1..=40)
+            .map(|i| format!("pasted line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.insert_pasted_text(&block);
+        state.insert_composer_text(" after");
+        assert!(state.composer_paste_span.is_some(), "span recorded");
+
+        // A tiny fragment delivered as a Paste event (fast IME burst, or
+        // bracketed paste over SSH/tmux). This clears the flag but keeps the
+        // span, and the block is far too big to re-open inline.
+        state.insert_pasted_text("x");
+        assert!(
+            !state.composer_pasted,
+            "precondition: the small paste cleared the flag"
+        );
+        assert!(
+            matches!(
+                state.composer_presentation(),
+                ComposerPresentation::Collapsed(_)
+            ),
+            "precondition: 40 lines stays collapsed past the typed threshold"
+        );
+        assert!(
+            state.composer_paste_span.is_some(),
+            "precondition: the span survived the flag being cleared"
+        );
+
+        state.delete_composer_prev_char();
+
+        assert!(
+            state.composer.contains("before"),
+            "text typed BEFORE the paste must survive: {:?}",
+            state.composer
+        );
+        assert!(
+            state.composer.contains("after"),
+            "text typed AFTER the paste must survive: {:?}",
+            state.composer
+        );
+        assert!(
+            !state.composer.contains("pasted line 1"),
+            "the pasted block itself is what Backspace removes: {:?}",
+            state.composer
+        );
     }
 
     fn big_paste_block() -> String {
