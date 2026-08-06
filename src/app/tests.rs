@@ -452,10 +452,12 @@ mod tests {
         // (codex P2 on the fixed-4s sweep). Same for the origin rest at the
         // cycle tail.
         let octopus_width = UnicodeWidthStr::width(OCTOPUS_SWIM_FRAMES[0]);
-        assert!(
-            OCTOPUS_EDGE_DWELL_MS >= 200,
-            "edge rest must cover at least one ~120ms repaint interval"
-        );
+        const {
+            assert!(
+                OCTOPUS_EDGE_DWELL_MS >= 200,
+                "edge rest must cover at least one ~120ms repaint interval"
+            );
+        }
         let leg = OCTOPUS_SWEEP_ONE_WAY_MS + OCTOPUS_EDGE_DWELL_MS;
         for wrap_width in [octopus_width + 2, 20usize, 40, 80, 146, 200, 1000] {
             let max = wrap_width.saturating_sub(octopus_width + 1);
@@ -1385,6 +1387,182 @@ mod tests {
             !text.contains("✽ Answering…"),
             "answering indicator must clear once answered:\n{text}"
         );
+    }
+
+    #[test]
+    fn should_render_markdown_in_btw_aside_via_shared_transcript_renderer() {
+        // The `/btw` aside answer must render as MARKDOWN, not plain text. It
+        // reuses the exact transcript renderer (`push_btw_aside_card` ->
+        // `push_message_block("btw", ..)` -> `push_formatted_body_marked`), so
+        // headings, inline bold/code, bullets, and syntect-highlighted fenced
+        // code blocks all format identically to an assistant message. This test
+        // exercises the aside's real overlay render path
+        // (`btw_overlay_wrapped_lines`) and asserts the styled spans, not text.
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("do the thing"), Message::assistant("on it")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.set_btw_answering(&session_id, "status?".into());
+        let answer = "# Heading Alpha\n\nProse with **BoldToken** and `CodeToken` here.\n\n\
+             - BulletOne\n- BulletTwo\n\n```rust\nlet fence_probe = 7;\n```\n";
+        assert!(
+            app.resolve_btw_answer(&session_id, answer.into()),
+            "answer resolves the answering aside"
+        );
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let aside = app.btw_aside_for(&session_id).expect("btw aside present");
+        let lines = btw_overlay_wrapped_lines(palette, aside, 100);
+        let joined: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect();
+        let span_eq = |needle: &str| {
+            lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .find(|span| span.content.as_ref() == needle)
+                .cloned()
+        };
+
+        // Inline bold: `**BoldToken**` -> "BoldToken" (markers stripped) + BOLD.
+        let bold = span_eq("BoldToken").expect("bold span rendered with markers stripped");
+        assert!(
+            bold.style.add_modifier.contains(Modifier::BOLD),
+            "**bold** must carry the BOLD modifier, not render as plain text"
+        );
+
+        // Inline code: `` `CodeToken` `` -> "CodeToken" in the code color.
+        let code = span_eq("CodeToken").expect("inline-code span rendered with backticks stripped");
+        assert_eq!(
+            code.style.fg,
+            palette.selected().fg,
+            "inline code uses the transcript's code color"
+        );
+
+        // Heading: `# Heading Alpha` -> bold, title color, marker stripped.
+        let heading = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.contains("Heading Alpha"))
+            .expect("heading span rendered");
+        assert!(
+            heading.style.add_modifier.contains(Modifier::BOLD),
+            "heading renders bold"
+        );
+        assert_eq!(
+            heading.style.fg,
+            palette.title().fg,
+            "heading uses the transcript's title color"
+        );
+
+        // Fenced code block goes through syntect (`push_code_block_lines`): a
+        // language label, a gutter, and the highlighted body all appear.
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.spans.iter().any(|span| span.content.contains("rust"))),
+            "fenced block renders its language label:\n{joined}"
+        );
+        assert!(
+            joined.contains("let fence_probe = 7"),
+            "fenced code body renders:\n{joined}"
+        );
+        assert!(
+            joined.contains('│'),
+            "fenced block draws a gutter:\n{joined}"
+        );
+
+        // Bullets render as list items.
+        assert!(
+            joined.contains("BulletOne") && joined.contains("BulletTwo"),
+            "bullet items render:\n{joined}"
+        );
+
+        // No raw markdown markers leak into the rendered aside.
+        assert!(!joined.contains("**"), "bold markers stripped:\n{joined}");
+        assert!(
+            !joined.contains("```"),
+            "fence delimiters consumed:\n{joined}"
+        );
+        assert!(
+            !joined.contains("# Heading"),
+            "heading marker stripped:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn should_render_partial_markdown_in_btw_aside_without_panicking() {
+        // A `/btw` aside is a LIVE draft: the answer can arrive mid-stream with
+        // an UNCLOSED code fence. The shared renderer flushes the open block at
+        // end of input (complete=false) instead of dropping it or panicking.
+        // Empty content and narrow/changing widths must also render cleanly.
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: None,
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        let palette = Palette::for_theme(ThemeName::Codex);
+
+        // Unclosed fence mid-stream.
+        app.set_btw_answering(&session_id, "q".into());
+        app.resolve_btw_answer(
+            &session_id,
+            "Working on it:\n\n```rust\nlet partial = ".into(),
+        );
+        let aside = app.btw_aside_for(&session_id).expect("aside present");
+        let joined: String = btw_overlay_wrapped_lines(palette, aside, 60)
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            joined.contains("rust"),
+            "in-flight fence still shows its language:\n{joined}"
+        );
+        assert!(
+            joined.contains("let partial ="),
+            "in-flight code body renders while the fence is still open:\n{joined}"
+        );
+
+        // Empty answer must not panic (renders an <empty> placeholder).
+        app.set_btw_answering(&session_id, "q2".into());
+        app.resolve_btw_answer(&session_id, String::new());
+        let aside = app.btw_aside_for(&session_id).expect("aside present");
+        let _ = btw_overlay_wrapped_lines(palette, aside, 40);
+
+        // Width changes across frames must not panic (re-wrap narrow then wide).
+        app.set_btw_answering(&session_id, "q3".into());
+        app.resolve_btw_answer(
+            &session_id,
+            "Some **bold** prose with a `code` token and a longer trailing sentence.".into(),
+        );
+        let aside = app.btw_aside_for(&session_id).expect("aside present");
+        for width in [8usize, 24, 80] {
+            let _ = btw_overlay_wrapped_lines(palette, aside, width);
+        }
     }
 
     #[test]
@@ -3099,6 +3277,52 @@ mod tests {
         assert!(text.contains("approval required"));
         assert!(!text.contains("Blocked:"));
         assert!(!text.contains("y/s/n approval"));
+    }
+
+    #[test]
+    fn markdown_table_divider_renders_without_body_rows() {
+        // A `|---|` separator is what marks row 0 as a header. The header row
+        // used to be inferred from row COUNT, so a table with a header and no
+        // body rows lost both its divider and its bold header and rendered as
+        // a plain one-row box. Tables WITH body rows already worked; this pins
+        // the empty-body case and keeps the populated case honest.
+        for (label, md, want_divider) in [
+            ("header only", "| A | B |\n|---|---|", true),
+            ("header + body", "| A | B |\n|---|---|\n| 1 | 2 |", true),
+            // No separator at all and a single row: nothing proves it is a
+            // header, so it must stay an undivided one-row box.
+            ("lone row, no separator", "| A | B |", false),
+        ] {
+            let app = AppState::new(
+                vec![SessionView {
+                    id: SessionKey("local:test".into()),
+                    title: "test".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![Message::assistant(md)],
+                    tasks: vec![],
+                    live_reply: None,
+                }],
+                0,
+                "ready".into(),
+                None,
+                false,
+            );
+            let buffer = rendered_buffer(&app, Palette::for_theme(ThemeName::Codex));
+            let text = rendered_rows(&buffer).join("\n");
+
+            assert!(
+                text.contains('\u{250c}') && text.contains('\u{2514}'),
+                "{label}: the table must still render as a bordered grid"
+            );
+            assert_eq!(
+                text.contains('\u{251c}'),
+                want_divider,
+                "{label}: header divider presence must match (got {:?})",
+                text.contains('\u{251c}')
+            );
+            // The raw separator source must never survive into the transcript.
+            assert!(!text.contains("|---|"), "{label}: raw separator leaked");
+        }
     }
 
     #[test]
@@ -10483,6 +10707,198 @@ mod tests {
         }
     }
 
+    /// Goal-echo regression, driven through the REAL path: submit + the
+    /// scrollback-sync + the inline live-tail render. A just-submitted prompt
+    /// must render EXACTLY ONCE across native scrollback and the live tail, for
+    /// every mid-turn disposition — staged (queued behind a busy goal), steered
+    /// (injected into the live turn), and the idle start. An earlier attempt
+    /// pinned on the flush-message COUNT, but `sync` advances that count to the
+    /// full committed length in the SAME frame, so the pin could never fire;
+    /// this drives the real path and shows the prompt is already rendered once,
+    /// which is what actually needs guarding.
+    #[test]
+    fn submitted_prompt_renders_exactly_once_through_real_path() {
+        use crate::store::Store;
+        let palette = Palette::for_theme(ThemeName::Slate);
+        const PROMPT: &str = "check the failing tests";
+
+        // Real event-loop tail: flush committed history to scrollback, then
+        // render the inline live tail with that frame's finalization.
+        fn render_counts(state: &AppState, palette: Palette) -> (usize, usize) {
+            let mut tracker = ScrollbackTracker::new();
+            let update = tracker.sync(state, palette, 100);
+            let scrollback = lines_text(&update.lines_to_insert);
+            let tail = viewport_rows_with_finalization(
+                state,
+                100,
+                40,
+                update.live_tail_finalization.as_ref(),
+            )
+            .join("\n");
+            (
+                scrollback.matches(PROMPT).count(),
+                tail.matches(PROMPT).count(),
+            )
+        }
+
+        fn running_goal_store() -> Store {
+            let turn = TurnId::new();
+            let mut store = Store {
+                state: AppState::new(
+                    vec![SessionView {
+                        id: SessionKey("local:test".into()),
+                        title: "t".into(),
+                        profile_id: Some("coding".into()),
+                        messages: vec![
+                            Message::user("run the goal"),
+                            Message::assistant("working"),
+                        ],
+                        tasks: vec![],
+                        live_reply: Some(crate::model::LiveReply {
+                            turn_id: turn,
+                            text: "still working".into(),
+                        }),
+                    }],
+                    0,
+                    "Working".into(),
+                    None,
+                    false,
+                ),
+            };
+            store.state.set_run_state_in_progress();
+            store
+        }
+
+        // Staged: a busy goal + no steer capability → the prompt queues.
+        let mut staged = running_goal_store();
+        staged.state.composer = PROMPT.into();
+        assert!(
+            staged.compose_command().is_none(),
+            "a mid-turn prompt with no steer support must stage"
+        );
+        let (s, t) = render_counts(&staged.state, palette);
+        assert_eq!(
+            s + t,
+            1,
+            "staged mid-turn prompt renders exactly once (scrollback={s}, tail={t})"
+        );
+
+        // Steered: a busy goal + turn/steer advertised → the prompt is injected.
+        let mut steered = running_goal_store();
+        steered.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_TURN_STEER,
+        ]));
+        steered.state.composer = PROMPT.into();
+        assert!(
+            steered.compose_command().is_some(),
+            "a mid-turn prompt with steer support must emit a steer command"
+        );
+        let (s, t) = render_counts(&steered.state, palette);
+        assert_eq!(
+            s + t,
+            1,
+            "steered mid-turn prompt renders exactly once (scrollback={s}, tail={t})"
+        );
+
+        // Idle: no active turn → the prompt starts a fresh turn.
+        let mut idle = Store {
+            state: AppState::new(
+                vec![SessionView {
+                    id: SessionKey("local:test".into()),
+                    title: "t".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![Message::user("prior")],
+                    tasks: vec![],
+                    live_reply: None,
+                }],
+                0,
+                "ready".into(),
+                None,
+                false,
+            ),
+        };
+        idle.state.composer = PROMPT.into();
+        assert!(
+            idle.compose_command().is_some(),
+            "an idle prompt starts a turn"
+        );
+        let (s, t) = render_counts(&idle.state, palette);
+        assert_eq!(
+            s + t,
+            1,
+            "idle prompt renders exactly once (scrollback={s}, tail={t})"
+        );
+    }
+
+    /// Guards against the duplicate an over-eager staging echo would cause:
+    /// staging text IDENTICAL to the active turn's still-unreconciled optimistic
+    /// prompt must NOT delete that prompt's optimistic tracker
+    /// (`record_submitted_user_prompt`'s content-dedup would remove ALL matching
+    /// trackers), or the server's canonical `UserMessage` echo appends a SECOND
+    /// row instead of promoting the existing one.
+    #[test]
+    fn staging_identical_text_does_not_duplicate_the_active_prompt() {
+        use crate::store::Store;
+        let turn = TurnId::new();
+        let sess = SessionKey("local:test".into());
+        let mut store = Store {
+            state: AppState::new(
+                vec![SessionView {
+                    id: sess.clone(),
+                    title: "t".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![Message::assistant("working")],
+                    tasks: vec![],
+                    live_reply: Some(crate::model::LiveReply {
+                        turn_id: turn.clone(),
+                        text: "still working".into(),
+                    }),
+                }],
+                0,
+                "Working".into(),
+                None,
+                false,
+            ),
+        };
+        store.state.set_run_state_in_progress();
+        // The ACTIVE turn's prompt is optimistically echoed, awaiting the
+        // server's canonical UserMessage.
+        store
+            .state
+            .record_submitted_user_prompt(sess.clone(), turn, "duplicate me".into());
+        assert_eq!(
+            store.state.optimistic_user_messages.len(),
+            1,
+            "precondition: the active prompt has one optimistic tracker"
+        );
+
+        // User stages IDENTICAL text mid-turn, via the real submit path.
+        store.state.composer = "duplicate me".into();
+        assert!(store.compose_command().is_none(), "identical text stages");
+        assert_eq!(
+            store.state.optimistic_user_messages.len(),
+            1,
+            "staging identical text must not delete the active prompt's optimistic tracker"
+        );
+
+        // The server's canonical echo for the ACTIVE prompt arrives.
+        store
+            .state
+            .apply_user_row_echo(&sess, "thread-1".into(), "duplicate me".into(), vec![]);
+        let user_rows = store
+            .state
+            .active_session()
+            .unwrap()
+            .messages
+            .iter()
+            .filter(|m| m.role.as_str() == "user" && m.content == "duplicate me")
+            .count();
+        assert_eq!(
+            user_rows, 1,
+            "the canonical echo must promote the existing row, not append a duplicate"
+        );
+    }
+
     #[test]
     fn glued_completed_segment_flushes_via_boundary_so_live_tail_holds_only_current_segment() {
         // Agentic narration segments are glued in live_reply (no blank line
@@ -12477,4 +12893,60 @@ mod running_row_regression {
         assert!(!text.contains("Using bash"), "old verb leaked:\n{text}");
         assert!(!text.contains("{\"cmd\""), "raw JSON leaked:\n{text}");
     }
+}
+
+/// `flow_activity_items` filtered on `turn_id` only. A background session's
+/// `agent/updated` pushes a turn-less chip, so with no turn running in the
+/// focused session it rendered in that session's transcript — the
+/// cross-session bleed #247 closed for other surfaces.
+#[test]
+fn activity_flow_excludes_other_sessions_items() {
+    let mut app = AppState::new(
+        vec![
+            SessionView {
+                id: SessionKey("local:focused".into()),
+                title: "focused".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            },
+            SessionView {
+                id: SessionKey("local:background".into()),
+                title: "background".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            },
+        ],
+        0, // focus the first
+        "ready".into(),
+        None,
+        false,
+    );
+
+    app.push_activity(
+        ActivityItem::new(ActivityKind::Progress, "peer agent".to_string(), "running")
+            .with_session(SessionKey("local:background".into())),
+    );
+    app.push_activity(ActivityItem::new(
+        ActivityKind::Progress,
+        "my agent".to_string(),
+        "running",
+    ));
+
+    let titles: Vec<&str> = flow_activity_items(&app)
+        .iter()
+        .map(|item| item.title.as_str())
+        .collect();
+    assert!(
+        titles.contains(&"my agent"),
+        "the focused session's own activity still renders: {titles:?}"
+    );
+    assert!(
+        !titles.contains(&"peer agent"),
+        "a background session's activity must NOT render in the focused \
+         session's transcript: {titles:?}"
+    );
 }
