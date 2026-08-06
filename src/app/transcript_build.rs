@@ -3255,7 +3255,7 @@ pub(super) fn push_inline_diff_preview(
 ) {
     // C6: when there is no usable line diff ("line diff unavailable for this
     // mutation"), hide the box entirely instead of rendering an empty preview
-    // with a dead "[/] select hunk | c stage" UI. Loading/error stay visible.
+    // with a dead "select hunk | stage" UI. Loading/error stay visible.
     if !diff.has_renderable_diff() {
         return;
     }
@@ -3318,8 +3318,18 @@ pub(super) fn push_inline_diff_preview(
 
         if !preview.files.is_empty() {
             // Footer hint: hunk navigation/staging, plus the view-mode toggle
-            // — or, when the transcript is too narrow to split, why `v` is
-            // disabled.
+            // — or, when the transcript is too narrow to split, why the toggle
+            // is disabled.
+            //
+            // The hint advertises the Alt binds, NOT the plain `[`/`]`/`c`/`v`
+            // keys. The plain keys are gated on `focus != Composer` (#485,
+            // because a bare letter cannot be both text and a command), and
+            // the composer is the usual focus while a preview is open — so a
+            // hint naming them would be wrong exactly when it is read. The Alt
+            // family works from any focus. This function has no access to
+            // focus, so a focus-aware hint would mean plumbing it through both
+            // call sites for a string; advertising the universally-correct
+            // binds is the simpler honest answer.
             let mut hint = t!("app.diff.select_stage_hint").into_owned();
             hint.push_str(" | ");
             if side_by_side_available {

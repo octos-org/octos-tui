@@ -718,6 +718,21 @@ fn keymap_menu() -> MenuSpec {
             "Up/K",
             t!("menu.keymap.item.menu_previous.desc"),
         ),
+        (
+            "diff.open-toggle",
+            "Alt+V",
+            t!("menu.keymap.item.diff_open_toggle.desc"),
+        ),
+        (
+            "diff.stage-hunk",
+            "Alt+C",
+            t!("menu.keymap.item.diff_stage_hunk.desc"),
+        ),
+        (
+            "diff.next-hunk",
+            "Alt+H",
+            t!("menu.keymap.item.diff_next_hunk.desc"),
+        ),
     ];
     let items = rows
         .into_iter()

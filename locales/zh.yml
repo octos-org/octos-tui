@@ -74,9 +74,9 @@ app:
     title: "差异预览"
     inline_patch: "内联补丁"
     loading: "正在加载差异预览……"
-    select_stage_hint: "[/] 选择代码块 | c 暂存所选差异上下文"
-    toggle_side_by_side_hint: "v 并排视图"
-    toggle_unified_hint: "v 统一视图"
+    select_stage_hint: "Alt+H 下一个代码块 | Alt+C 暂存所选差异上下文"
+    toggle_side_by_side_hint: "Alt+V 并排视图"
+    toggle_unified_hint: "Alt+V 统一视图"
     side_by_side_too_narrow: "并排视图需要至少 %{min} 列"
     more_files_hidden: "还有 %{count} 个文件已隐藏"
     line_unavailable: "此更改无可用的行级差异"
@@ -744,6 +744,12 @@ menu:
         desc: 移动到下一行。
       menu_previous:
         desc: 移动到上一行。
+      diff_open_toggle:
+        desc: 打开 diff 预览；打开后切换 统一/并排 视图。
+      diff_stage_hunk:
+        desc: 将选中的 diff hunk 暂存为 composer 提示词。
+      diff_next_hunk:
+        desc: 循环到下一个 diff hunk（到末尾后回到开头）。
     preview_body: 此视图展示菜单层面的按键。持久化按键编辑将在后续版本提供。
     preview_title: 编辑
     search: 筛选按键绑定
@@ -1465,7 +1471,7 @@ status:
   doctor_caps_not_received_recovery: "请等待 `config/capabilities/list` 或重新连接传输。"
   doctor_appui_target: "Octos UI 目标：%{target}"
   doctor_no_transport: "未配置 Octos UI 传输"
-  doctor_no_transport_recovery: "使用 octos tui --target <stdio:...|ws://...> 启动 TUI。"
+  doctor_no_transport_recovery: "请使用 octos-tui --stdio-command \"octos serve --stdio\" 或 octos-tui --endpoint ws://<host>:<port>/api/ui-protocol/ws 重新启动。"
   onboarding_doctor_summary: "引导诊断 — %{summary}"
   ps_active_turn: "活动回合 %{id}"
   ps_idle: "空闲"

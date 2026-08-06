@@ -2670,7 +2670,7 @@ mod tests {
             "surplus removed line keeps a blank right column: {left_only:?}"
         );
         assert!(
-            rows.iter().any(|row| row.contains("v unified")),
+            rows.iter().any(|row| row.contains("Alt+V unified")),
             "footer hint advertises the toggle back to unified"
         );
     }
@@ -2729,7 +2729,7 @@ mod tests {
             "default mode stays unified: {removed_row:?}"
         );
         assert!(
-            rows.iter().any(|row| row.contains("v side-by-side")),
+            rows.iter().any(|row| row.contains("Alt+V side-by-side")),
             "footer hint advertises the side-by-side toggle"
         );
     }
@@ -7565,7 +7565,7 @@ mod tests {
         // the hint line that immediately follows it) so the word "ready" in the
         // unrelated bottom status bar can't mask a regression.
         let title = text.find("Roman numeral patch").expect("title in header");
-        let hint = text.find("select hunk").expect("hint after header");
+        let hint = text.find("next hunk").expect("hint after header");
         let header_region = &text[title..hint];
         assert!(
             !header_region.contains("ready"),

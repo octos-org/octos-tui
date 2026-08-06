@@ -83,9 +83,9 @@ app:
     title: "Diff Preview"
     inline_patch: "Inline patch"
     loading: "Loading diff preview..."
-    select_stage_hint: "[/] select hunk | c stage selected diff context"
-    toggle_side_by_side_hint: "v side-by-side"
-    toggle_unified_hint: "v unified"
+    select_stage_hint: "Alt+H next hunk | Alt+C stage selected diff context"
+    toggle_side_by_side_hint: "Alt+V side-by-side"
+    toggle_unified_hint: "Alt+V unified"
     side_by_side_too_narrow: "side-by-side needs %{min}+ cols"
     more_files_hidden: "+%{count} more file(s) hidden"
     line_unavailable: "line diff unavailable for this mutation"
@@ -724,7 +724,7 @@ status:
   doctor_caps_not_received_recovery: "Wait for `config/capabilities/list` or reconnect the transport."
   doctor_appui_target: "Octos UI target: %{target}"
   doctor_no_transport: "no Octos UI transport configured"
-  doctor_no_transport_recovery: "Start the TUI with `octos tui --target <stdio:...|ws://...>`."
+  doctor_no_transport_recovery: "Relaunch with `octos-tui --stdio-command \"octos serve --stdio\"` or `octos-tui --endpoint ws://<host>:<port>/api/ui-protocol/ws`."
   onboarding_doctor_summary: "Onboarding doctor — %{summary}"
   ps_active_turn: "active turn %{id}"
   ps_idle: "idle"
@@ -1222,6 +1222,12 @@ menu:
         desc: Move to next row.
       menu_previous:
         desc: Move to previous row.
+      diff_open_toggle:
+        desc: Open diff preview; toggle unified/side-by-side when open.
+      diff_stage_hunk:
+        desc: Stage the selected diff hunk as a composer prompt.
+      diff_next_hunk:
+        desc: Cycle to the next diff hunk (wraps at the end).
     preview_body: This slice exposes the menu surface. Persisted keymap editing remains a follow-up provider action.
     preview_title: Editing
     search: Filter key bindings
