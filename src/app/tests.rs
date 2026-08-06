@@ -7565,7 +7565,7 @@ mod tests {
         // the hint line that immediately follows it) so the word "ready" in the
         // unrelated bottom status bar can't mask a regression.
         let title = text.find("Roman numeral patch").expect("title in header");
-        let hint = text.find("select hunk").expect("hint after header");
+        let hint = text.find("next hunk").expect("hint after header");
         let header_region = &text[title..hint];
         assert!(
             !header_region.contains("ready"),

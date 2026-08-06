@@ -74,7 +74,7 @@ app:
     title: "差异预览"
     inline_patch: "内联补丁"
     loading: "正在加载差异预览……"
-    select_stage_hint: "Alt+N/M 选择代码块 | Alt+C 暂存所选差异上下文"
+    select_stage_hint: "Alt+H 下一个代码块 | Alt+C 暂存所选差异上下文"
     toggle_side_by_side_hint: "Alt+V 并排视图"
     toggle_unified_hint: "Alt+V 统一视图"
     side_by_side_too_narrow: "并排视图需要至少 %{min} 列"
@@ -748,8 +748,8 @@ menu:
         desc: 打开 diff 预览；打开后切换 统一/并排 视图。
       diff_stage_hunk:
         desc: 将选中的 diff hunk 暂存为 composer 提示词。
-      diff_next_prev_hunk:
-        desc: 移动到下一个/上一个 diff hunk。
+      diff_next_hunk:
+        desc: 循环到下一个 diff hunk（到末尾后回到开头）。
     preview_body: 此视图展示菜单层面的按键。持久化按键编辑将在后续版本提供。
     preview_title: 编辑
     search: 筛选按键绑定

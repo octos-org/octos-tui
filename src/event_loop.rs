@@ -895,13 +895,18 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         return KeyAction::Continue;
     }
 
-    if is_alt_char(&key, 'n') && store.state.diff_preview.active {
+    // ONE key, cycling. `select_next_hunk` wraps ((current + 1) % len), so a
+    // single bind reaches every hunk and no "previous" key is needed.
+    //
+    // Alt+H, not Alt+N/Alt+M. Alt+N is already the peer-approval DENY bind
+    // (see `first_blocked_peer_with_approval` below) and this arm runs first,
+    // so an Alt+N here would swallow "no" exactly when a diff preview is
+    // open — which is precisely when a reviewer is deciding. Alt+M is unusable
+    // as a pair anyway: Ctrl+M is carriage return, so it cannot be aliased for
+    // terminals without Option-as-Meta. Alt+H also dodges the macOS dead keys
+    // (Option+E/I/N/U compose accents and emit nothing on their own).
+    if is_alt_char(&key, 'h') && store.state.diff_preview.active {
         store.select_next_diff_hunk();
-        return KeyAction::Continue;
-    }
-
-    if is_alt_char(&key, 'm') && store.state.diff_preview.active {
-        store.select_prev_diff_hunk();
         return KeyAction::Continue;
     }
 
@@ -6266,7 +6271,7 @@ mod tests {
     }
 
     #[test]
-    fn alt_n_and_alt_m_walk_hunks_from_composer_focus() {
+    fn alt_h_cycles_hunks_and_wraps_from_composer_focus() {
         let mut store = store_with_sessions(1);
         store.state.focus = FocusPane::Composer;
         let session_id = store.state.sessions[0].id.clone();
@@ -6276,20 +6281,50 @@ mod tests {
             .apply_result(diff_result_with_two_hunks(session_id));
         assert_eq!(store.state.diff_preview.selected_hunk, 0);
 
+        let alt_h = || modified_key(KeyCode::Char('h'), KeyModifiers::ALT);
+        let mut walk = vec![store.state.diff_preview.selected_hunk];
+        for _ in 0..4 {
+            handle_key(&mut store, alt_h());
+            walk.push(store.state.diff_preview.selected_hunk);
+        }
+
+        // Wrapping is what makes ONE key sufficient: with no "previous" bind,
+        // every hunk must still be reachable by continuing forward.
+        assert_eq!(
+            walk,
+            vec![0, 1, 0, 1, 0],
+            "Alt+H must cycle, not stop at the last hunk"
+        );
+    }
+
+    /// Alt+N is the peer-approval DENY bind. The diff-preview arms run BEFORE
+    /// it, so binding hunk navigation to Alt+N would swallow "no" exactly when
+    /// a preview is open — which is precisely when a reviewer is deciding.
+    /// This pins that Alt+N is not claimed by the diff surface.
+    #[test]
+    fn alt_n_is_not_stolen_by_an_open_diff_preview() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        let session_id = store.state.sessions[0].id.clone();
+        store
+            .state
+            .diff_preview
+            .apply_result(diff_result_with_two_hunks(session_id));
+        assert!(store.state.diff_preview.active);
+        let before = store.state.diff_preview.selected_hunk;
+
         handle_key(
             &mut store,
             modified_key(KeyCode::Char('n'), KeyModifiers::ALT),
         );
-        assert_eq!(store.state.diff_preview.selected_hunk, 1, "Alt+N advances");
 
-        handle_key(
-            &mut store,
-            modified_key(KeyCode::Char('m'), KeyModifiers::ALT),
+        assert_eq!(
+            store.state.diff_preview.selected_hunk, before,
+            "Alt+N must stay free for the peer-approval deny path"
         );
-        assert_eq!(store.state.diff_preview.selected_hunk, 0, "Alt+M goes back");
     }
 
-    /// With no preview open, Alt+C/N/M must stay free rather than silently
+    /// With no preview open, Alt+C/H must stay free rather than silently
     /// swallowing the keystroke.
     #[test]
     fn alt_hunk_keys_are_inert_when_no_preview_is_open() {
@@ -6297,7 +6332,7 @@ mod tests {
         store.state.focus = FocusPane::Composer;
         assert!(!store.state.diff_preview.active);
 
-        for ch in ['c', 'n', 'm'] {
+        for ch in ['c', 'h'] {
             handle_key(
                 &mut store,
                 modified_key(KeyCode::Char(ch), KeyModifiers::ALT),

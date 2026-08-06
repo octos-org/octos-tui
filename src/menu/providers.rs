@@ -729,9 +729,9 @@ fn keymap_menu() -> MenuSpec {
             t!("menu.keymap.item.diff_stage_hunk.desc"),
         ),
         (
-            "diff.next-prev-hunk",
-            "Alt+N/M",
-            t!("menu.keymap.item.diff_next_prev_hunk.desc"),
+            "diff.next-hunk",
+            "Alt+H",
+            t!("menu.keymap.item.diff_next_hunk.desc"),
         ),
     ];
     let items = rows
