@@ -58,6 +58,18 @@ pub(crate) const MIN_OCTOS_VERSION: &str = "1.1.0";
 /// Set to any value to disable auto-install (a missing backend then errors).
 const OPT_OUT_ENV: &str = "OCTOSCODE_NO_AUTO_INSTALL";
 
+/// Pre-rename spelling of [`OPT_OUT_ENV`], still honoured.
+///
+/// This is the ONLY environment variable the binary reads that was part of the
+/// documented `octos-tui` contract (the other ~157 `OCTOS_TUI_*` names belong
+/// to the soak harness, and the two `_BIN`/`_DIR` ones are read by our own
+/// scripts — all renamed in lockstep). Someone with
+/// `OCTOS_TUI_NO_AUTO_INSTALL=1` in a CI job or shell profile would otherwise
+/// find auto-install silently switching itself back on, which is exactly the
+/// kind of quiet breakage a rename must not cause. Honour it, say so once,
+/// and drop it a release or two after the rename has settled.
+const OPT_OUT_ENV_LEGACY: &str = "OCTOS_TUI_NO_AUTO_INSTALL";
+
 /// Default Homebrew formula for the octos server, as `<user>/<tap>/<formula>`.
 /// This MUST reference the PUBLIC tap `octos-org/tap` (→ `github.com/octos-org/
 /// homebrew-tap`). The shorthand `octos-org/octos` instead makes brew auto-tap
@@ -167,7 +179,50 @@ enum Probe {
 }
 
 fn opted_out() -> bool {
-    std::env::var_os(OPT_OUT_ENV).is_some_and(|v| !v.is_empty())
+    match opt_out_from(
+        std::env::var_os(OPT_OUT_ENV),
+        std::env::var_os(OPT_OUT_ENV_LEGACY),
+    ) {
+        OptOut::No => false,
+        OptOut::Current => true,
+        OptOut::Legacy => {
+            // Warn once per process, not per probe — `opted_out` is called
+            // from several paths and a repeated notice would bury the real
+            // output.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!(
+                    "octoscode: {OPT_OUT_ENV_LEGACY} is deprecated — \
+                     rename it to {OPT_OUT_ENV}. Still honoured for now."
+                );
+            });
+            true
+        }
+    }
+}
+
+/// Which spelling (if either) opted out.
+#[derive(Debug, PartialEq, Eq)]
+enum OptOut {
+    No,
+    Current,
+    /// Only the pre-rename name was set — honour it, but say so.
+    Legacy,
+}
+
+/// Pure resolver behind [`opted_out`]: the current name wins, the pre-rename
+/// name still counts, and empty values are ignored (matching the original
+/// `!v.is_empty()` semantics — `FOO=` is not "set"). Split out so the
+/// back-compat is testable without mutating process env (`std::env::set_var`
+/// is `unsafe` under edition 2024 + `unsafe_code = deny`).
+fn opt_out_from(current: Option<std::ffi::OsString>, legacy: Option<std::ffi::OsString>) -> OptOut {
+    if current.is_some_and(|v| !v.is_empty()) {
+        return OptOut::Current;
+    }
+    if legacy.is_some_and(|v| !v.is_empty()) {
+        return OptOut::Legacy;
+    }
+    OptOut::No
 }
 
 /// Find a usable octos. `program` is the bare name the stdio command runs
@@ -1135,6 +1190,42 @@ mod tests {
         assert_eq!(
             env_or("OCTOSCODE_UNSET_ENV_XYZZY_12345", "the-default"),
             "the-default"
+        );
+    }
+
+    /// The rename must not silently re-enable auto-install for anyone who set
+    /// the opt-out under the old name. This is the ONE documented env var the
+    /// binary reads that predates the rename.
+    #[test]
+    fn legacy_opt_out_env_is_still_honoured() {
+        use std::ffi::OsString;
+        let set = |v: &str| Some(OsString::from(v));
+
+        assert_eq!(opt_out_from(None, None), OptOut::No, "neither set");
+        assert_eq!(
+            opt_out_from(set("1"), None),
+            OptOut::Current,
+            "current name opts out"
+        );
+        assert_eq!(
+            opt_out_from(None, set("1")),
+            OptOut::Legacy,
+            "pre-rename name must STILL opt out, or a CI job that set it \
+             silently gets auto-install back"
+        );
+        assert_eq!(
+            opt_out_from(set("1"), set("1")),
+            OptOut::Current,
+            "current name wins so the deprecation notice stays quiet"
+        );
+
+        // Empty is not "set" — preserves the original `!v.is_empty()` rule.
+        assert_eq!(opt_out_from(set(""), None), OptOut::No, "empty current");
+        assert_eq!(opt_out_from(None, set("")), OptOut::No, "empty legacy");
+        assert_eq!(
+            opt_out_from(set(""), set("1")),
+            OptOut::Legacy,
+            "empty current falls through to a real legacy value"
         );
     }
 }

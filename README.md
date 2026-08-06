@@ -502,6 +502,14 @@ source/fallback locale, so any untranslated string falls back to English.
 | `TERM=xterm-256color` | Avoids missing terminfo/color issues on remote hosts. |
 | `OCTOSCODE_BIN` | Forces a specific built `octoscode` binary for harnesses. |
 | `OCTOSCODE_DIR` | Points Octos harness scripts at this standalone TUI repo. |
+| `OCTOSCODE_NO_AUTO_INSTALL` | Disables backend auto-install (a missing `octos` then errors). |
+
+> **Renamed from `octos-tui`.** Every `OCTOS_TUI_*` variable is now
+> `OCTOSCODE_*`. The one exception that still works is
+> `OCTOS_TUI_NO_AUTO_INSTALL` — it is honoured with a one-time deprecation
+> notice so an existing CI job or shell profile does not silently get
+> auto-install switched back on. Rename it; the fallback goes away a release or
+> two after the rename settles.
 
 ### Workspace (cwd) behavior
 
