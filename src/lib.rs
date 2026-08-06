@@ -266,6 +266,74 @@ mod i18n_tests {
         }
     }
 
+    /// Recovery advice must name flags that ACTUALLY EXIST.
+    ///
+    /// This string shipped for a long time as
+    /// "Start the TUI with `octos tui --target <stdio:...|ws://...>`", which is
+    /// wrong twice over: `octos` has no `tui` subcommand, and there is no
+    /// `--target` flag. It is the advice shown when the TUI cannot find a
+    /// transport — i.e. to a user who is already stuck — so following it landed
+    /// them on "unrecognized subcommand".
+    ///
+    /// Assert against the real clap definition rather than a hardcoded list, so
+    /// this keeps working as flags are added or renamed.
+    #[test]
+    fn doctor_recovery_advice_names_only_real_cli_flags() {
+        let command = crate::cli::cli_command();
+        let real: std::collections::HashSet<String> = command
+            .get_arguments()
+            .filter_map(|arg| arg.get_long())
+            .map(|long| format!("--{long}"))
+            .collect();
+        assert!(
+            real.contains("--endpoint") && real.contains("--stdio-command"),
+            "sanity: the flags this advice names must be discoverable from clap"
+        );
+
+        for locale in ["en", "zh"] {
+            let advice = t!("status.doctor_no_transport_recovery", locale = locale);
+
+            // Only flags addressed to THIS binary count. A quoted value like
+            // `--stdio-command "octos serve --stdio"` carries the SERVER's
+            // flags, which clap here knows nothing about, so drop quoted spans
+            // before scanning.
+            let mut outside = String::new();
+            let mut in_quotes = false;
+            for ch in advice.chars() {
+                if ch == '"' {
+                    in_quotes = !in_quotes;
+                    continue;
+                }
+                if !in_quotes {
+                    outside.push(ch);
+                }
+            }
+
+            // Every `--flag` token the advice mentions must be a real long flag.
+            for token in outside.split_whitespace() {
+                let flag: String = token
+                    .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+                    .to_string();
+                if !flag.starts_with("--") || flag.len() <= 2 {
+                    continue;
+                }
+                assert!(
+                    real.contains(&flag),
+                    "{locale} recovery advice names `{flag}`, which is not a \
+                     real CLI flag. Advice: {advice}"
+                );
+            }
+
+            // `octos` is the SERVER binary and has no `tui` subcommand; the TUI
+            // is its own binary. Pin the specific wrong invocation that shipped.
+            assert!(
+                !advice.contains("octos tui"),
+                "{locale} recovery advice tells the user to run `octos tui`, \
+                 which is not a subcommand. Advice: {advice}"
+            );
+        }
+    }
+
     /// UX2 A.3/B.2: the new onboarding teaching-panel + workspace-step keys
     /// resolve in BOTH locales (rust-i18n echoes the key on a miss, so a typo or
     /// a missing `zh` translation would leave the dotted key in the output).

@@ -724,7 +724,7 @@ status:
   doctor_caps_not_received_recovery: "Wait for `config/capabilities/list` or reconnect the transport."
   doctor_appui_target: "Octos UI target: %{target}"
   doctor_no_transport: "no Octos UI transport configured"
-  doctor_no_transport_recovery: "Start the TUI with `octos tui --target <stdio:...|ws://...>`."
+  doctor_no_transport_recovery: "Relaunch with `octos-tui --stdio-command \"octos serve --stdio\"` or `octos-tui --endpoint ws://<host>:<port>/api/ui-protocol/ws`."
   onboarding_doctor_summary: "Onboarding doctor — %{summary}"
   ps_active_turn: "active turn %{id}"
   ps_idle: "idle"

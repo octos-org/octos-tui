@@ -1465,7 +1465,7 @@ status:
   doctor_caps_not_received_recovery: "请等待 `config/capabilities/list` 或重新连接传输。"
   doctor_appui_target: "Octos UI 目标：%{target}"
   doctor_no_transport: "未配置 Octos UI 传输"
-  doctor_no_transport_recovery: "使用 octos tui --target <stdio:...|ws://...> 启动 TUI。"
+  doctor_no_transport_recovery: "请使用 octos-tui --stdio-command \"octos serve --stdio\" 或 octos-tui --endpoint ws://<host>:<port>/api/ui-protocol/ws 重新启动。"
   onboarding_doctor_summary: "引导诊断 — %{summary}"
   ps_active_turn: "活动回合 %{id}"
   ps_idle: "空闲"
