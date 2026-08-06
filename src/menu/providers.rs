@@ -7665,6 +7665,16 @@ mod tests {
         assert_eq!(params.profile_id.as_deref(), Some("glm"));
         assert_eq!(params.cwd.as_deref(), Some("/tmp/proj"));
 
+        // The switch-row loop reserves digit '1' for start-here by starting
+        // its own numbering at `index + 1`. That reservation was a comment
+        // only: `launch.start` was built inline inside `vec![…]` with no
+        // shortcut, so pressing '1' did nothing while '2' worked.
+        assert_eq!(
+            start.shortcut,
+            Some(KeyBinding::new(KeyCode::Char('1'), KeyModifiers::empty())),
+            "start-here row must claim the digit '1' its neighbours reserve"
+        );
+
         // One switch row per profile already used in this folder.
         let switch = spec
             .items
@@ -7675,6 +7685,11 @@ mod tests {
             panic!("switch row must open a session");
         };
         assert_eq!(switch_params.profile_id.as_deref(), Some("deepseek"));
+        assert_eq!(
+            switch.shortcut,
+            Some(KeyBinding::new(KeyCode::Char('2'), KeyModifiers::empty())),
+            "switch rows follow start-here, so the first is '2' not '1'"
+        );
         assert!(has_row(&spec, "launch.cancel"), "offers a cancel escape");
     }
 
