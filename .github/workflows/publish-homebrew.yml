@@ -143,14 +143,59 @@ jobs:
           # 0 approvals required) — a direct `git push origin main` is rejected
           # with GH013. Push the formula to a branch and SELF-MERGE a PR: that
           # satisfies the rule with the built-in token and needs no approval.
+          #
+          # EVERY STEP BELOW IS RESUMABLE. This job used to be unrecoverable
+          # once it failed anywhere: it pushed the branch, then died on
+          # `gh pr create` (see #474 — "GitHub Actions is not permitted to
+          # create or approve pull requests", a repo/org setting). The branch
+          # it left behind then turned the retry's `git push -f` into a real
+          # force-push, which the `no-push` ruleset rejects with GH013 — so
+          # neither `gh run rerun` nor `workflow_dispatch` could ever succeed
+          # and the formula had to be merged by hand. Two blockers stacked.
+          #
+          # So: never force-push, never delete the branch (the same ruleset
+          # forbids `deletion`), and treat "already exists" as success at each
+          # step. A retry now resumes from wherever the last attempt stopped.
           BRANCH="homebrew/${TAG}-${CHANNEL}"
-          git checkout -b "$BRANCH"
+          FORMULA_BODY="$(cat "$FORMULA_FILE")"
+
+          # Build ON TOP of the remote branch when it exists, so the push is a
+          # fast-forward rather than a force. Re-apply the rendered formula
+          # after the checkout, since switching branches replaces the file.
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            git fetch origin "$BRANCH"
+            git checkout -B "$BRANCH" "origin/$BRANCH"
+          else
+            git checkout -b "$BRANCH"
+          fi
+          printf '%s\n' "$FORMULA_BODY" > "$FORMULA_FILE"
+
           git add "$FORMULA_FILE"
-          git commit -m "octoscode ${TAG}: update Homebrew formula (${CHANNEL})"
-          git push -f origin "$BRANCH"
-          gh pr create --base main --head "$BRANCH" \
-            --title "octoscode ${TAG}: update Homebrew formula (${CHANNEL})" \
-            --body "Automated Homebrew formula bump for ${TAG} (${CHANNEL} channel)."
+          if git diff --cached --quiet -- "$FORMULA_FILE"; then
+            echo "branch $BRANCH already carries this formula; skipping commit."
+          else
+            git commit -m "octoscode ${TAG}: update Homebrew formula (${CHANNEL})"
+            git push origin "$BRANCH"
+          fi
+
+          # `gh pr create` fails if a PR is already open for this head, and is
+          # blocked outright while #474 stands. Neither should abort the job —
+          # a PR that already exists is exactly what we want.
+          if [ -z "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number')" ]; then
+            gh pr create --base main --head "$BRANCH" \
+              --title "octoscode ${TAG}: update Homebrew formula (${CHANNEL})" \
+              --body "Automated Homebrew formula bump for ${TAG} (${CHANNEL} channel)." \
+              || echo "::warning::could not open the PR (see #474); branch $BRANCH is pushed and ready to merge by hand"
+          fi
+
+          # No --delete-branch: the `no-push` ruleset forbids deletion, and a
+          # failure there would mask an otherwise successful merge.
           # Mergeability is computed async — retry once after a short wait.
-          gh pr merge "$BRANCH" --squash --delete-branch \
-            || (sleep 12 && gh pr merge "$BRANCH" --squash --delete-branch)
+          if [ -n "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number')" ]; then
+            gh pr merge "$BRANCH" --squash \
+              || (sleep 12 && gh pr merge "$BRANCH" --squash) \
+              || { echo "::error::branch $BRANCH is pushed but could not be merged; merge it by hand"; exit 1; }
+          else
+            echo "::error::no PR for $BRANCH — see #474. The branch is pushed; open and merge it by hand."
+            exit 1
+          fi
