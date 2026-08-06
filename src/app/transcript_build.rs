@@ -2194,7 +2194,16 @@ pub(super) fn flush_markdown_table(
         // the pane (e.g. a many-column table in a narrow transcript), hard-cut
         // the row so ratatui never wraps it into a broken grid.
         lines.push(chat_line(clip_line_spans(spans, width), bg));
-        if header {
+        // A rule under EVERY row except the last, not just under the header.
+        // Markdown itself cannot express this — GFM has exactly one separator,
+        // between header and body — so whether body rows are divided is purely
+        // a rendering choice, and ruled rows stay legible when cells wrap or
+        // run long.
+        //
+        // The `header ||` arm is load-bearing for #479: a table with a `|---|`
+        // separator but NO body rows is a single-row table, so the row-index
+        // test alone would drop its header divider and undo that fix.
+        if header || row_idx + 1 < table.len() {
             lines.push(table_border_line(
                 indent, &widths, '├', '┼', '┤', border, bg, width,
             ));

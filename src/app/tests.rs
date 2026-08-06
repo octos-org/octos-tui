@@ -3524,6 +3524,57 @@ mod tests {
         assert!(!text.contains("-+-"));
     }
 
+    /// Every row except the last is followed by a rule, not just the header.
+    ///
+    /// Markdown cannot express this — GFM has exactly ONE separator, between
+    /// header and body — so the number of rules is entirely a rendering
+    /// decision, and no model output can change it.
+    #[test]
+    fn render_markdown_table_rules_every_row_but_the_last() {
+        let app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant(
+                    "| A | B |\n|---|---|\n| r1 | x |\n| r2 | y |\n| r3 | z |",
+                )],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        let buffer = rendered_buffer(&app, Palette::for_theme(ThemeName::Codex));
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+
+        // Count only the TABLE's own rules: the composer draws a box too, but
+        // a single-column box has no `┼` (that glyph needs a column join).
+        let mid = rows.iter().filter(|r| r.contains('┼')).count();
+
+        // header + 3 body rows = 4 rows, so 3 interior rules — under the
+        // header and between the body rows, but NOT after the last row, which
+        // the bottom border closes.
+        assert_eq!(
+            mid,
+            3,
+            "expected a rule under the header AND between body rows, got {mid}\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            rows.iter().any(|r| r.contains('┴')),
+            "table still closes with a bottom border"
+        );
+    }
+
     #[test]
     fn render_markdown_table_fits_and_truncates_on_narrow_width() {
         let wide = "| Column One | Column Two | Column Three |\n|---|---|---|\n| a very long first cell value | another long-ish value | a third long cell value |";
