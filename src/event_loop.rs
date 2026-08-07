@@ -114,6 +114,7 @@ pub fn run(cli: Cli) -> Result<()> {
     // Seed Vim modal editing from the launch flag/config (default off). Runtime
     // `/vimmode` toggles it afterwards; the composer starts in Insert.
     store.state.vim_mode = cli.vim_mode;
+    store.state.steer_mid_turn = cli.steer_mid_turn;
     // Seed the onboarding workspace candidate so the first-launch workspace
     // probe validates a real directory. The explicit `--cwd` wins; when it is
     // absent the store falls back to the process working directory (for
@@ -5918,6 +5919,7 @@ mod tests {
     fn bang_draft_enter_mid_turn_executes_locally_never_steers_or_stages() {
         let mut store = store_with_sessions(1);
         store.state.focus = FocusPane::Composer;
+        store.state.steer_mid_turn = true;
         store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
             crate::model::APPUI_METHOD_TURN_STEER,
         ]));

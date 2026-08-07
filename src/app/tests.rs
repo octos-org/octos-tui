@@ -10836,6 +10836,7 @@ mod tests {
 
         // Steered: a busy goal + turn/steer advertised → the prompt is injected.
         let mut steered = running_goal_store();
+        steered.state.steer_mid_turn = true;
         steered.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
             crate::model::APPUI_METHOD_TURN_STEER,
         ]));

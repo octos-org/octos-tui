@@ -318,6 +318,9 @@ so plain `octoscode` is the real thing, not the mock.
 --lang en|zh             UI language; falls back to OCTOS_LANG / LANG. Default: en
 --scroll-mode <mode>     native (terminal scrollback, default) | pinned (composer pinned)
 --vim-mode               enable Vim modal editing in the composer (default off)
+--steer-mid-turn         inject a prompt typed mid-turn into the RUNNING turn
+                         (default off: mid-turn prompts queue FIFO and each runs
+                         as its own turn, in the order typed)
 ```
 
 `--endpoint` and `--stdio-command` are mutually exclusive — pick one transport.
@@ -339,7 +342,8 @@ settings loaded by `octos serve`, and the TUI config rejects them.
   "theme": "codex",
   "lang": "en",
   "scroll-mode": "native",
-  "vim-mode": false
+  "vim-mode": false,
+  "steer-mid-turn": false
 }
 ```
 

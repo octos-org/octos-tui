@@ -627,9 +627,11 @@ impl Store {
     }
 
     /// Mid-turn staging chokepoint for every prompt submission (composer,
-    /// menu `SubmitPrompt`, `PromptTemplate`): an active turn STEERS the
-    /// prompt into the live turn when the server supports `turn/steer`
-    /// (octos#1807) and otherwise stages it onto the session's queue —
+    /// menu `SubmitPrompt`, `PromptTemplate`): an active turn stages the
+    /// prompt FIFO onto the session's queue (each staged prompt drains as
+    /// its OWN turn at turn-end, preserving order), unless steering is
+    /// opted in (`steer_mid_turn`) AND the server supports `turn/steer`
+    /// (octos#1807) — then the prompt is injected into the live turn —
     /// starting a SECOND `turn/start` concurrently with the live turn
     /// corrupts run-state bookkeeping and races the server — while an idle
     /// session starts the turn. Slash/bang inputs never reach here: the
@@ -679,6 +681,17 @@ impl Store {
     /// prompt is stashed FIFO in `pending_turn_steers` so an attributed
     /// steer failure can re-stage it (the text must never be lost).
     fn try_steer_live_turn(&mut self, prompt: &str) -> Option<AppUiCommand> {
+        // Steering is OPT-IN (`steer_mid_turn` config / --steer-mid-turn).
+        // The default answers "what does Enter mean while the agent works?"
+        // with FIFO: stage the prompt and run it as its OWN turn after the
+        // current one finishes, in the order typed. A steer is delivered as
+        // a bare user message into the RUNNING loop, and the model treats
+        // the newest instruction as superseding the work in progress — an
+        // effective interrupt-and-pivot. Right tool for a course
+        // correction; wrong default for "also do this next".
+        if !self.state.steer_mid_turn {
+            return None;
+        }
         if self.state.readonly {
             return None;
         }
@@ -16284,6 +16297,7 @@ mod tests {
 
     fn steer_capable_store() -> Store {
         let mut store = store_with_empty_session();
+        store.state.steer_mid_turn = true;
         store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
             crate::model::APPUI_METHOD_TURN_STEER,
         ]));
@@ -16307,6 +16321,79 @@ mod tests {
             },
         )));
         params.turn_id
+    }
+
+    /// The DEFAULT for a prompt typed while the agent is working: stage FIFO
+    /// and run it as its OWN turn after the current one finishes — even when
+    /// the server advertises `turn/steer`. A steer is delivered as a bare
+    /// user message into the RUNNING loop, where the model treats the newest
+    /// instruction as superseding the work in progress — an effective
+    /// interrupt-and-pivot. That redirection is opt-in (`steer_mid_turn`);
+    /// plain Enter means "next, in order", and every prompt gets processed.
+    #[test]
+    fn mid_turn_prompts_stage_fifo_by_default_even_when_steer_capable() {
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_TURN_STEER,
+        ]));
+        assert!(
+            !store.state.steer_mid_turn,
+            "precondition: steering is opt-in, off by default"
+        );
+        let session_id = store.state.sessions[0].id.clone();
+        let first_turn = start_live_turn(&mut store, "review the design");
+
+        // Two prompts typed while the turn streams: neither may steer or
+        // start a concurrent turn.
+        assert!(
+            store
+                .queue_or_start_prompt_turn("also update the docs".into(), "sent".into())
+                .is_none(),
+            "a mid-turn prompt must stage, not emit a command"
+        );
+        assert!(
+            store
+                .queue_or_start_prompt_turn("then cut a release".into(), "sent".into())
+                .is_none(),
+            "the second mid-turn prompt must stage behind the first"
+        );
+        assert!(
+            store.state.pending_turn_steers.is_empty(),
+            "nothing may enter the steer stash by default"
+        );
+        assert_eq!(
+            store.state.pending_messages,
+            vec![
+                "also update the docs".to_string(),
+                "then cut a release".to_string()
+            ],
+            "both prompts stage FIFO in the order typed"
+        );
+
+        // The running turn finishes → the terminal itself drains ONE prompt,
+        // oldest first (the #233 FIFO gate), returned as the next command.
+        let drained = store
+            .apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+                TurnCompletedEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id: first_turn,
+                    cursor: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                    session_result: None,
+                },
+            )))
+            .expect("the first staged prompt drains at turn end");
+        assert!(
+            format!("{drained:?}").contains("also update the docs"),
+            "the OLDEST staged prompt runs first, got {drained:?}"
+        );
+        assert_eq!(
+            store.state.pending_messages,
+            vec!["then cut a release".to_string()],
+            "the newer prompt stays queued until the next turn ends"
+        );
     }
 
     /// Live turn + capability → the typed prompt STEERS (expected_turn_id =
@@ -30746,6 +30833,7 @@ now analyzing the bus module"
     fn mid_turn_prompt_steers_into_a_live_turn_that_was_not_interrupted() {
         let turn_id = TurnId::new();
         let mut store = store_with_live_reply(turn_id, "streaming");
+        store.state.steer_mid_turn = true;
         store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
             crate::model::APPUI_METHOD_TURN_STEER,
         ]));
@@ -30774,6 +30862,7 @@ now analyzing the bus module"
         let turn_id = TurnId::new();
         let mut store = store_with_live_reply(turn_id.clone(), "streaming");
         let session_id = store.state.sessions[0].id.clone();
+        store.state.steer_mid_turn = true;
         store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
             crate::model::APPUI_METHOD_TURN_STEER,
         ]));

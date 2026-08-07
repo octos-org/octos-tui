@@ -145,6 +145,9 @@ pub struct Cli {
     pub scroll_mode: ScrollMode,
     /// Vim modal editing for the composer (opt-in; default off).
     pub vim_mode: bool,
+    /// Mid-turn prompts steer the live turn instead of staging FIFO
+    /// (opt-in; default off — prompts queue and run in order).
+    pub steer_mid_turn: bool,
 }
 
 /// Version string like `0.2.2-rc.7 (94e43fd 2026-07-17)` — the Cargo version
@@ -254,6 +257,12 @@ struct CliArgs {
     /// also toggled at runtime with `/vimmode`.
     #[arg(long = "vim-mode")]
     pub vim_mode: bool,
+
+    /// Steer a prompt typed mid-turn into the RUNNING turn (octos#1807)
+    /// instead of queueing it. Off by default: queued prompts each run as
+    /// their own turn, in the order typed.
+    #[arg(long = "steer-mid-turn")]
+    pub steer_mid_turn: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -291,6 +300,9 @@ pub struct CliFileConfig {
 
     #[serde(alias = "vim_mode")]
     pub vim_mode: Option<bool>,
+
+    #[serde(alias = "steer_mid_turn")]
+    pub steer_mid_turn: Option<bool>,
 }
 
 impl Cli {
@@ -403,6 +415,7 @@ impl Cli {
             // "false"), so the CLI flag only force-enables; the config provides
             // the default when the flag is absent.
             vim_mode: args.vim_mode || file_config.vim_mode.unwrap_or(false),
+            steer_mid_turn: args.steer_mid_turn || file_config.steer_mid_turn.unwrap_or(false),
         })
     }
 }

@@ -4452,6 +4452,16 @@ pub struct AppState {
     /// plain text field (equivalent to always-Insert); `composer_mode` is only
     /// consulted when this is true.
     pub vim_mode: bool,
+    /// octos#1807 steering as an OPT-IN: when true, a prompt typed while a
+    /// turn is running is injected into the LIVE turn via `turn/steer`. The
+    /// default is false — mid-turn prompts stage FIFO in `pending_messages`
+    /// and each drains as its OWN turn at turn-end, so every prompt is
+    /// processed to completion in the order it was typed. Steering makes the
+    /// model treat the newest instruction as superseding the work in
+    /// progress (the steer lands as a bare `role: user` message mid-loop),
+    /// which reads as "interrupt and pivot" — the right tool for a course
+    /// correction, the wrong default for "also do this next".
+    pub steer_mid_turn: bool,
     /// Current composer editing mode under Vim. Defaults to `Insert` so typing
     /// works immediately when Vim is enabled; `Esc` switches to `Normal`.
     pub composer_mode: ComposerMode,
@@ -6536,6 +6546,7 @@ impl AppState {
             goal_objective_folded_effective: std::cell::Cell::new(false),
             pinned_scroll: false,
             vim_mode: false,
+            steer_mid_turn: false,
             composer_mode: ComposerMode::Insert,
             composer_vim_pending: None,
             config_path: None,
