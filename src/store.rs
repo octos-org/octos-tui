@@ -10236,7 +10236,7 @@ impl Store {
             return None;
         }
 
-        if !is_noisy_progress_status(&status) {
+        if !is_noisy_progress_status(&status) && !progress_metadata_is_bare_kind(&event.metadata) {
             self.state.status = status;
         }
         None
@@ -14503,6 +14503,21 @@ fn progress_status(event: &UiProgressEvent) -> String {
     }
 
     format!("Progress: {}", metadata.kind)
+}
+
+/// True when a progress event's metadata carries nothing but its `kind` —
+/// i.e. `progress_status` would hit its `Progress: {kind}` fallback. The
+/// status LINE only shows progress with user-facing content: a bare kind echo
+/// ("Progress: thinking") next to the Working spinner is double narration.
+/// The fallback string still titles activity-log rows for kinds that record
+/// activity, so this gates only the status-line assignment. Mirrors the
+/// branch order of [`progress_status`].
+fn progress_metadata_is_bare_kind(metadata: &octos_core::ui_protocol::UiProgressMetadata) -> bool {
+    metadata.message.as_deref().is_none_or(str::is_empty)
+        && metadata.retry.is_none()
+        && metadata.file_mutation.is_none()
+        && metadata.token_cost.is_none()
+        && metadata.label.as_deref().is_none_or(str::is_empty)
 }
 
 fn is_noisy_progress_status(status: &str) -> bool {
@@ -32739,6 +32754,30 @@ now analyzing the bus module"
                 .last()
                 .and_then(|activity| activity.detail.as_deref()),
             Some("modify src/lib.rs | diff preview ready")
+        );
+    }
+
+    #[test]
+    fn bare_kind_progress_does_not_clobber_the_status_line() {
+        // `Progress: thinking` next to the Working spinner is double
+        // narration (user feedback 2026-08-08): a progress event whose
+        // metadata carries nothing but its kind has no user-facing content —
+        // the spinner/phase already say the turn is running. It must not
+        // overwrite the status line (the bare-kind string still titles
+        // activity-log rows for kinds that record activity).
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.status = "ready".into();
+
+        store.apply_event(AppUiEvent::Progress(UiProgressEvent::new(
+            session_id,
+            None,
+            UiProgressMetadata::new(progress_kinds::THINKING),
+        )));
+
+        assert_eq!(
+            store.state.status, "ready",
+            "a bare-kind progress event must not become the status line"
         );
     }
 
