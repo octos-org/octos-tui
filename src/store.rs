@@ -11306,6 +11306,46 @@ impl Store {
                     .find(|segment| segment.id == assistant_segment_id)
                     .cloned()
             });
+        // Containment guard (#471): a canonical row replayed AFTER the whole
+        // turn already streamed over the legacy lane, whose text the live
+        // buffer already contains verbatim. Keep the buffer and record the
+        // segment as satisfied — do NOT clear + re-seed.
+        //
+        // The rebuild is not harmless even when the content is identical: a
+        // tool-using turn persists multiple segments (preamble, final answer)
+        // and re-seeding joins them WITHOUT the glue the legacy stream carried
+        // ("…first:\n\nHere…" became "…first:Here…"). That is a NON-PREFIX
+        // rewrite of a buffer whose stable prefix the inline viewport may have
+        // already flushed into immutable native scrollback. The flush
+        // watermark then (correctly) freezes, commit-time coverage (correctly)
+        // fails to match the committed message against the flushed text, and
+        // the committed block re-renders everything the user already read —
+        // the answer on screen twice. The store cannot see the watermark
+        // (viewport-owned), but containment makes that unnecessary: keeping
+        // the buffer byte-identical is prefix-safe by construction, and the
+        // canonical content is verbatim on screen already. The next hydrate
+        // still replaces committed history with the server projection.
+        if known_segment.is_none() {
+            let sanitized = crate::sanitize::strip_terminal_controls(&text);
+            if !sanitized.trim().is_empty()
+                && let Some(start_offset) = self
+                    .find_session(session_id)
+                    .and_then(|session| session.live_reply.as_ref())
+                    .filter(|live_reply| &live_reply.turn_id == turn_id)
+                    .and_then(|live_reply| live_reply.text.find(sanitized.as_ref()))
+            {
+                self.state
+                    .v2_live_assistant_segments
+                    .entry(key.clone())
+                    .or_default()
+                    .push(V2AssistantSegment {
+                        id: assistant_segment_id,
+                        start_offset,
+                        finalized: true,
+                    });
+                return;
+            }
+        }
         // Double-render fix (#379 review F1): on stdio the turn streams over
         // the LEGACY lane, so the live reply already holds this very text but
         // NO v2 segment was ever recorded. This persisted row is the CANONICAL
@@ -36594,6 +36634,127 @@ now analyzing the bus module"
             1,
             "the preamble must render exactly once, got: {visible:?}"
         );
+    }
+
+    /// #471 (the half the store-level tests could not see): a tool-using turn
+    /// streams its WHOLE answer over the legacy lane (deltas carry no segment
+    /// id), the inline viewport flushes the stable prefix into NATIVE
+    /// SCROLLBACK while the turn runs, and only then do the canonical
+    /// `assistant_persisted` rows replay — preamble and final answer as two
+    /// segments.
+    ///
+    /// The #379 clear + re-seed rebuilt the live reply as `preamble+answer`
+    /// with the streamed glue ("\n\n") dropped — a NON-PREFIX rewrite of a
+    /// buffer whose prefix was already immutable in scrollback. The watermark
+    /// (correctly) refuses to advance over a buffer that no longer starts with
+    /// it, commit-time coverage (correctly) only dedups a message that starts
+    /// with the flushed text, so the committed block re-rendered everything the
+    /// user had already read: the answer on screen twice.
+    ///
+    /// Pins the whole chain: flushed watermark + rebuilt commit + dedup render
+    /// must show each part of the answer exactly once.
+    #[test]
+    fn flushed_legacy_prefix_renders_once_after_canonical_replay() {
+        use crate::cli::ThemeName;
+        use crate::theme::Palette;
+
+        const PREAMBLE: &str = "Reviewing the design docs first:";
+        const ANSWER_HEAD: &str = "Here is the critical review of the design.";
+        const ANSWER_TAIL: &str = "Overall the plan is sound.";
+
+        let turn = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        // The legacy lane glued the paragraphs with blank lines as they
+        // streamed — this is the reconstructed 3738-char shape from the wire
+        // capture, in miniature.
+        let streamed = format!("{PREAMBLE}\n\n{ANSWER_HEAD}\n\n{ANSWER_TAIL}");
+        let mut store = store_with_live_reply(turn.clone(), streamed.clone());
+
+        // One inline-viewport frame while the turn is still live: the stable
+        // prefix (through the last blank line) is written to native scrollback.
+        let watermark = crate::app::next_live_turn_finalization(&store.state, None)
+            .expect("live turn advances the flush watermark");
+        assert!(
+            watermark.reply_flushed_text.contains(ANSWER_HEAD),
+            "precondition: the answer head flushed to scrollback before the \
+             canonical rows arrived, got {:?}",
+            watermark.reply_flushed_text
+        );
+        assert!(
+            streamed.starts_with(watermark.reply_flushed_text.as_str()),
+            "precondition: the watermark is a prefix of the streamed text"
+        );
+
+        // Canonical replay lands at the END of the turn: two persisted rows
+        // whose glue differs from what streamed (52 + 3683 = 3735 vs 3738 on
+        // the real wire).
+        store.apply_v2_assistant_persisted(&session_id, &turn, "seg-1".into(), PREAMBLE.into());
+        store.apply_v2_assistant_persisted(
+            &session_id,
+            &turn,
+            "seg-2".into(),
+            format!("{ANSWER_HEAD}\n\n{ANSWER_TAIL}"),
+        );
+
+        // The live buffer must stay an EXTENSION of what scrollback already
+        // holds — the invariant the non-prefix rebuild violated.
+        let live = store.state.sessions[0]
+            .live_reply
+            .as_ref()
+            .expect("live reply survives the replay")
+            .text
+            .clone();
+        assert!(
+            live.starts_with(watermark.reply_flushed_text.as_str()),
+            "the canonical replay must not rewrite text that already flushed \
+             to immutable scrollback: watermark {:?} vs live {:?}",
+            watermark.reply_flushed_text,
+            live
+        );
+
+        // The legacy terminal commits the reply; the viewport then renders the
+        // newly committed history against the archived watermark (the exact
+        // `finalized_history_lines_range_dedup_live` call in viewport.rs).
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        let rendered = crate::app::finalized_history_lines_range_dedup_live(
+            &store.state,
+            Palette::for_theme(ThemeName::Codex),
+            120,
+            0,
+            std::slice::from_ref(&watermark),
+        );
+        let rendered_text = rendered
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Native scrollback already holds the watermark text; the dedup render
+        // appends below it. Each part of the answer must appear exactly once
+        // across the two.
+        let on_screen = format!("{}\n{}", watermark.reply_flushed_text, rendered_text);
+        for part in [PREAMBLE, ANSWER_HEAD, ANSWER_TAIL] {
+            assert_eq!(
+                on_screen.matches(part).count(),
+                1,
+                "{part:?} must render exactly once, got:\n{on_screen}"
+            );
+        }
     }
 
     /// stdio wedge regression (#379 review F1): the persisted v2 rows register
