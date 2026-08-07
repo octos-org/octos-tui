@@ -4708,9 +4708,11 @@ pub(crate) fn context_window_usage(app: &AppState, session_id: &SessionKey) -> O
     Some((used, window))
 }
 
-/// Context-window fill ratio (0.0..=1.0) for the harness row `LineGauge`, or
-/// `None` when no `token_estimate` is known for the active session yet.
-fn harness_context_ratio(app: &AppState) -> Option<f64> {
+/// Raw context-window fill for the active session — UNCLAMPED, so an estimate
+/// over the window reads >1.0 (e.g. a server-rebuilt ledger published before
+/// its open/pre-turn compaction pass). `None` when no `token_estimate` is
+/// known for the active session yet.
+fn harness_context_fill(app: &AppState) -> Option<f64> {
     let session = app.active_session()?;
     let token_estimate = app
         .context_lifecycle_for(&session.id)?
@@ -4729,12 +4731,22 @@ fn harness_context_ratio(app: &AppState) -> Option<f64> {
     if window == 0 {
         return None;
     }
-    Some((token_estimate as f64 / window as f64).clamp(0.0, 1.0))
+    Some(token_estimate as f64 / window as f64)
 }
 
-/// Integer context-window percent (0..=100) for the `ctx N%` label.
+/// Context-window fill ratio (0.0..=1.0) for the harness row `LineGauge`, or
+/// `None` when no `token_estimate` is known for the active session yet.
+fn harness_context_ratio(app: &AppState) -> Option<f64> {
+    harness_context_fill(app).map(|fill| fill.clamp(0.0, 1.0))
+}
+
+/// Integer context-window percent for the `ctx N%` label. Deliberately NOT
+/// clamped at 100: the label prints the raw used/max counts next to it, and a
+/// clamped percent contradicts them (`ctx 1.2M/1M ~100%` — field report
+/// 2026-08-07). Saturates at 999 so a pathological estimate cannot blow the
+/// status row width open.
 fn harness_context_percent(app: &AppState) -> Option<u16> {
-    harness_context_ratio(app).map(|ratio| (ratio * 100.0).round() as u16)
+    harness_context_fill(app).map(|fill| ((fill * 100.0).round() as u64).min(999) as u16)
 }
 
 /// Full context-window label for the harness gauge/row: `ctx 128K/1M ~13%`.

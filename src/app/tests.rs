@@ -10076,6 +10076,61 @@ mod tests {
     }
 
     #[test]
+    fn harness_context_label_shows_true_percent_when_over_window() {
+        // Field report 2026-08-07: a rebuilt server ledger published a
+        // 1.17M-token estimate for a 1M-window model and the status row read
+        // `ctx 1.2M/1M ~100%` — the raw counts contradicted their own
+        // percent. The BAR stays clamped (a `LineGauge` ratio must be 0..=1)
+        // but the label must report the true fill.
+        let session_id = SessionKey("local:test".into());
+        let mut app = autonomy_app_state();
+        app.context_lifecycle_mut(&session_id).state = Some(crate::model::ContextLifecycleState {
+            session_id: session_id.clone(),
+            thread_id: None,
+            generation: 1,
+            transcript_hash: String::new(),
+            item_count: 4145,
+            token_estimate: 1_168_156,
+            recovery_state: "rebuilt".into(),
+            last_checkpoint_id: None,
+            last_compaction_id: None,
+        });
+        app.session_context_window
+            .insert(session_id.clone(), 1_048_576);
+
+        // 1_168_156 / 1_048_576 = 111.4% — the label says so...
+        assert_eq!(harness_context_percent(&app), Some(111));
+        let label = harness_context_label(&app).expect("label renders");
+        assert!(
+            label.ends_with("~111%"),
+            "over-window label must show the true percent, got: {label}"
+        );
+        // ...while the gauge bar itself stays clamped for the renderer.
+        assert_eq!(harness_context_ratio(&app), Some(1.0));
+    }
+
+    #[test]
+    fn harness_context_percent_is_capped_at_999() {
+        // A pathological estimate (or a wrong tiny window) must not blow the
+        // status row width open: the textual percent saturates at 999%.
+        let session_id = SessionKey("local:test".into());
+        let mut app = autonomy_app_state();
+        app.context_lifecycle_mut(&session_id).state = Some(crate::model::ContextLifecycleState {
+            session_id: session_id.clone(),
+            thread_id: None,
+            generation: 1,
+            transcript_hash: String::new(),
+            item_count: 10,
+            token_estimate: 64_000,
+            recovery_state: "healthy".into(),
+            last_checkpoint_id: None,
+            last_compaction_id: None,
+        });
+        app.session_context_window.insert(session_id.clone(), 1_000);
+        assert_eq!(harness_context_percent(&app), Some(999));
+    }
+
+    #[test]
     fn harness_line_shows_the_persona_word_over_the_working_phase() {
         use octos_core::ui_protocol::SessionOrchestrationEvent;
         let session_id = SessionKey("local:test".into());
