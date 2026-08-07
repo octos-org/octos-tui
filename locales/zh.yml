@@ -500,11 +500,13 @@ command:
   theme:
     desc: 选择本地 TUI 主题
   saveconfig:
-    desc: "把当前主题/语言/滚动模式保存到配置文件。"
+    desc: "把当前主题/语言/滚动模式/Vim 模式/转向模式保存到配置文件。"
   scrollmode:
     desc: "切换滚轮滚动模式：/scrollmode [native|pinned]（不带参数为切换）。"
   vimmode:
     desc: "切换输入框的 Vim 模态编辑（Normal/Insert）。"
+  steer:
+    desc: "切换运行中按 Enter 的含义：/steer [on|off] —— on 注入当前轮次，off（默认）按顺序排队。"
   thinking:
     desc: 设置思考模型的思考强度：/thinking low|medium|high|max|default
   threads:
@@ -1652,6 +1654,11 @@ scrollmode:
 vimmode:
   enabled: "Vim 模式：开 —— Esc 进 Normal，i 进 Insert（当前 Insert）。"
   disabled: "Vim 模式：关 —— 输入框恢复为普通文本框。"
+steer:
+  enabled: "转向模式：开 —— 运行中输入的提示词会注入到正在进行的轮次。"
+  enabled_unsupported: "转向模式：开 —— 但当前服务器不支持 turn/steer；提示词仍会排队，连接到支持的服务器后生效。"
+  disabled: "转向模式：关 —— 运行中输入的提示词按顺序排队执行。"
+  unknown: "未知取值：%{value}。用法：/steer [on|off]（不带参数则切换）。"
 thinking:
   cleared: 已清除推理强度，使用服务器默认值。
   no_session: 没有活动会话——请先打开或选择一个会话。

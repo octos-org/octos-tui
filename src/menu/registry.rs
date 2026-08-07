@@ -904,6 +904,15 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
             entry: CommandEntry::LocalAction(LocalAction::SaveConfig),
         },
         CommandSpec {
+            name: "steer",
+            aliases: &["steer-mid-turn", "steermode"],
+            description: "command.steer.desc",
+            category: CommandCategory::Settings,
+            availability: CommandAvailability::always(),
+            inline_args: InlineArgMode::Optional,
+            entry: CommandEntry::LocalAction(LocalAction::SetSteerMidTurn),
+        },
+        CommandSpec {
             name: "vimmode",
             aliases: &["vim-mode"],
             description: "command.vimmode.desc",

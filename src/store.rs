@@ -2669,6 +2669,11 @@ impl Store {
                 self.close_all_menus();
                 None
             }
+            LocalAction::SetSteerMidTurn => {
+                self.dispatch_set_steer_mid_turn(inline_args.unwrap_or_default());
+                self.close_all_menus();
+                None
+            }
             LocalAction::SetThinkingLevel(level) => self.dispatch_set_thinking_level(level),
             LocalAction::ToggleReasoningDisplay => self.dispatch_toggle_reasoning_display(),
             LocalAction::CopyLastReply => {
@@ -3254,6 +3259,7 @@ impl Store {
             lang,
             scroll_mode,
             self.state.vim_mode,
+            self.state.steer_mid_turn,
         ) {
             Ok(()) => {
                 self.state.status =
@@ -3276,6 +3282,45 @@ impl Store {
             t!("vimmode.enabled").into_owned()
         } else {
             t!("vimmode.disabled").into_owned()
+        };
+    }
+
+    /// `/steer` — runtime switch for what Enter means while a turn is
+    /// running. Bare command toggles; `on`/`off` set explicitly. On: a
+    /// mid-turn prompt is INJECTED into the running turn (`turn/steer`) and
+    /// the model pivots to it. Off (the default): mid-turn prompts queue
+    /// FIFO and each runs as its OWN turn, in the order typed. Status-row
+    /// only (persist with `/saveconfig`).
+    fn dispatch_set_steer_mid_turn(&mut self, inline_args: &str) {
+        let arg = inline_args.trim().to_ascii_lowercase();
+        let steer = match arg.as_str() {
+            "" => !self.state.steer_mid_turn,
+            "on" | "true" | "enable" | "enabled" => true,
+            "off" | "false" | "disable" | "disabled" => false,
+            other => {
+                self.state.status = t!("steer.unknown", value = other.to_string()).into_owned();
+                return;
+            }
+        };
+        self.state.steer_mid_turn = steer;
+        self.state.status = if steer {
+            let supported = self
+                .state
+                .capabilities
+                .as_ref()
+                .is_some_and(|capabilities| {
+                    capabilities.supports_method(crate::model::APPUI_METHOD_TURN_STEER)
+                });
+            if supported {
+                t!("steer.enabled").into_owned()
+            } else {
+                // Honest status: the flag is set, but THIS server cannot
+                // steer — prompts keep queueing until a capable server is
+                // connected (the flag then engages without re-toggling).
+                t!("steer.enabled_unsupported").into_owned()
+            }
+        } else {
+            t!("steer.disabled").into_owned()
         };
     }
 
@@ -16394,6 +16439,53 @@ mod tests {
             vec!["then cut a release".to_string()],
             "the newer prompt stays queued until the next turn ends"
         );
+    }
+
+    /// `/steer` — bare toggles, `on`/`off` set, unknown values report usage
+    /// and change nothing. Runtime counterpart of `--steer-mid-turn`.
+    #[test]
+    fn slash_steer_toggles_and_sets_explicitly() {
+        let mut store = steer_capable_store();
+        store.state.steer_mid_turn = false;
+
+        store.dispatch_set_steer_mid_turn("");
+        assert!(store.state.steer_mid_turn, "bare /steer toggles on");
+        assert_eq!(store.state.status, t!("steer.enabled"));
+
+        store.dispatch_set_steer_mid_turn("");
+        assert!(!store.state.steer_mid_turn, "bare /steer toggles back off");
+        assert_eq!(store.state.status, t!("steer.disabled"));
+
+        store.dispatch_set_steer_mid_turn("on");
+        assert!(store.state.steer_mid_turn);
+        store.dispatch_set_steer_mid_turn("off");
+        assert!(!store.state.steer_mid_turn);
+
+        store.dispatch_set_steer_mid_turn("sideways");
+        assert!(
+            !store.state.steer_mid_turn,
+            "an unknown value must not change the mode"
+        );
+        assert!(
+            store.state.status.contains("sideways"),
+            "usage status names the rejected value: {}",
+            store.state.status
+        );
+    }
+
+    /// Turning steer ON against a server without `turn/steer` must say so —
+    /// the flag is set (it engages after reconnecting to a capable server)
+    /// but prompts keep queueing, and a plain "on" status would read as the
+    /// steer silently not working.
+    #[test]
+    fn slash_steer_on_reports_missing_server_capability() {
+        let mut store = store_with_empty_session();
+        assert!(store.state.capabilities.is_none());
+
+        store.dispatch_set_steer_mid_turn("on");
+
+        assert!(store.state.steer_mid_turn, "the flag is still set");
+        assert_eq!(store.state.status, t!("steer.enabled_unsupported"));
     }
 
     /// Live turn + capability → the typed prompt STEERS (expected_turn_id =

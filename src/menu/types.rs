@@ -137,6 +137,7 @@ impl CommandSpec {
                 | "scrollmode"
                 | "saveconfig"
                 | "vimmode"
+                | "steer"
                 | "statusline"
                 | "title"
                 | "keymap"
@@ -340,6 +341,7 @@ pub enum LocalAction {
     /// `/scrollmode <native|pinned>` sets). Only flips the runtime
     /// `AppState.pinned_scroll`; the launch config stays the default source.
     SetScrollMode,
+    SetSteerMidTurn,
     /// Copy the last assistant reply for the active session to the system
     /// clipboard (`/copy`). The store stages the text on
     /// `AppState::pending_clipboard`; the event loop emits the OSC 52 escape

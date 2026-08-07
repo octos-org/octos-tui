@@ -347,7 +347,7 @@ settings loaded by `octos serve`, and the TUI config rejects them.
 }
 ```
 
-`/saveconfig` writes the active `theme` / `lang` / `scroll-mode` / `vim-mode`
+`/saveconfig` writes the active `theme` / `lang` / `scroll-mode` / `vim-mode` / `steer-mid-turn`
 back into this file (merging — it never clobbers transport keys like
 `stdio_command`); without `--config` it falls back to
 `~/.config/octoscode/config.json`.
@@ -393,7 +393,8 @@ q          quit
 /thinking   set reasoning effort for thinking models, per session (menu, or /thinking high)
 /scrollmode switch wheel-scroll behavior (toggle, or /scrollmode native|pinned)
 /vimmode    toggle Vim modal editing in the composer (Normal/Insert)
-/saveconfig persist the active theme / language / scroll-mode / vim-mode to the config file
+/saveconfig persist the active theme / language / scroll-mode / vim-mode / steer-mode to the config file
+/steer      switch what Enter means mid-turn: on injects into the running turn, off (default) queues FIFO
 /onboard    set onboarding fields inline (name, username, email, key, ...)
 /copy       copy the last assistant reply to the clipboard (works over SSH)
 /status     snapshot-backed session, runtime, and connection status

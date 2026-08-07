@@ -102,6 +102,7 @@ fn saveconfig_does_not_clobber_an_unreadable_config() {
         Lang::En,
         ScrollMode::Pinned,
         false,
+        false,
     );
 
     assert!(
@@ -130,6 +131,11 @@ fn saved_config_roundtrips_through_loader() {
     assert_eq!(config.theme, Some(ThemeName::Solarized));
     assert_eq!(config.scroll_mode, Some(ScrollMode::Native));
     assert!(config.lang.is_some(), "lang persisted too");
+    assert_eq!(
+        config.steer_mid_turn,
+        Some(false),
+        "/saveconfig persists the steer-mid-turn toggle alongside the other UI settings"
+    );
 }
 
 #[test]

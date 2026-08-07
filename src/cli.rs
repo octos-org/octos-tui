@@ -260,7 +260,8 @@ struct CliArgs {
 
     /// Steer a prompt typed mid-turn into the RUNNING turn (octos#1807)
     /// instead of queueing it. Off by default: queued prompts each run as
-    /// their own turn, in the order typed.
+    /// their own turn, in the order typed. Also toggled at runtime with
+    /// `/steer` (persist with `/saveconfig`).
     #[arg(long = "steer-mid-turn")]
     pub steer_mid_turn: bool,
 }
@@ -501,7 +502,8 @@ fn config_path_from_home(
     )
 }
 
-/// Persist the runtime UI settings (theme / lang / scroll-mode / vim-mode) back
+/// Persist the runtime UI settings (theme / lang / scroll-mode / vim-mode /
+/// steer-mid-turn) back
 /// into the config file, MERGING into whatever is already there: the existing
 /// JSON is read as a generic object and only these keys are patched, so
 /// transport keys (stdio-command, profile-id, session, endpoint, …) and any
@@ -513,12 +515,14 @@ pub fn save_ui_settings(
     lang: Lang,
     scroll_mode: ScrollMode,
     vim_mode: bool,
+    steer_mid_turn: bool,
 ) -> Result<()> {
     let mut entries = serde_json::Map::new();
     entries.insert("theme".into(), theme.as_str().into());
     entries.insert("lang".into(), lang.code().into());
     entries.insert("scroll-mode".into(), scroll_mode.as_str().into());
     entries.insert("vim-mode".into(), vim_mode.into());
+    entries.insert("steer-mid-turn".into(), steer_mid_turn.into());
     merge_into_config(path, &entries)
 }
 

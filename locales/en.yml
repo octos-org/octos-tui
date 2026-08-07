@@ -473,6 +473,11 @@ scrollmode:
 vimmode:
   enabled: "Vim mode: on — Esc for Normal, i to insert (Insert mode now)."
   disabled: "Vim mode: off — the composer is a plain text field again."
+steer:
+  enabled: "Steer mode: on — a prompt typed mid-turn is injected into the RUNNING turn."
+  enabled_unsupported: "Steer mode: on — but this server lacks turn/steer; prompts still queue until a capable server connects."
+  disabled: "Steer mode: off — mid-turn prompts queue and run in order."
+  unknown: "Unknown value: %{value}. Usage: /steer [on|off] (bare toggles)."
 thinking:
   usage: "Reasoning effort: %{current}. Usage: /thinking <low|medium|high|max|default>."
   set: "Reasoning effort set to %{level}."
@@ -977,11 +982,13 @@ command:
   theme:
     desc: Choose the local TUI theme.
   saveconfig:
-    desc: "Save the active appearance, language and scroll-mode to the config file."
+    desc: "Save the active appearance, language, scroll-mode, vim-mode and steer-mode to the config file."
   scrollmode:
     desc: 'Switch wheel-scroll behavior: /scrollmode [native|pinned] (bare toggles).'
   vimmode:
     desc: "Toggle Vim modal editing in the composer (Normal/Insert)."
+  steer:
+    desc: "Switch what Enter means mid-turn: /steer [on|off] — on injects into the running turn, off (default) queues FIFO."
   thinking:
     desc: 'Set reasoning effort for thinking models: /thinking low|medium|high|max|default.'
   threads:

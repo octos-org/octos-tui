@@ -110,7 +110,7 @@ fn show(path: &Path) -> Result<i32> {
 fn print_edit_hint(path: &Path) {
     println!(
         "\nEdit {} directly to change settings, or use the runtime commands \
-         /theme, /lang, /vimmode, and /saveconfig (and the octoscode CLI flags).",
+         /theme, /lang, /vimmode, /steer, and /saveconfig (and the octoscode CLI flags).",
         path.display()
     );
 }
