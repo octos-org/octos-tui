@@ -4747,7 +4747,11 @@ mod tests {
         assert!(text.contains("state"));
         assert!(text.contains("running"));
         assert!(text.contains("approval"));
-        assert!(text.contains("1 msgs/0 tasks"));
+        // Status-line declutter: the msgs/tasks counter, the constant
+        // "interactive" word, and the turn id are gone — /context and /ps own
+        // the counts, and "Working" already says a turn is live.
+        assert!(!text.contains("msgs/"));
+        assert!(!text.contains("interactive active"));
     }
 
     /// Regression (indent-not-honored): the agent-task child row used to be one

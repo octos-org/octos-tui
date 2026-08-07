@@ -1819,21 +1819,6 @@ pub(super) fn render_composer(app: &AppState, palette: Palette, area: Rect) -> P
 }
 
 pub(super) fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
-    let mode = if app.readonly {
-        t!("app.status.read_only").to_string()
-    } else {
-        t!("app.status.interactive").to_string()
-    };
-    let turn = app
-        .active_turn()
-        .map(|(_, turn_id)| {
-            t!(
-                "app.status.turn_active",
-                id = short_id(&turn_id.0.to_string())
-            )
-            .to_string()
-        })
-        .unwrap_or_else(|| t!("app.status.turn_idle").to_string());
     let profile = app
         .active_session()
         .and_then(|session| session.profile_id.as_deref())
@@ -1843,17 +1828,6 @@ pub(super) fn render_status(app: &AppState, palette: Palette) -> Paragraph<'stat
     } else {
         t!("app.status.approval_gated").to_string()
     };
-    let context = app
-        .active_session()
-        .map(|session| {
-            t!(
-                "app.statusbar.msgs_tasks",
-                msgs = session.messages.len(),
-                tasks = session.tasks.len()
-            )
-            .into_owned()
-        })
-        .unwrap_or_else(|| t!("app.status.no_session").to_string());
     // Loop chip: an ACTIVE loop fires real model turns on an interval —
     // the operator must see that at a glance, or a forgotten loop burns
     // tokens invisibly (it only ever showed in the server log). Paused
@@ -1870,10 +1844,7 @@ pub(super) fn render_status(app: &AppState, palette: Palette) -> Paragraph<'stat
                 t!("app.statusbar.loops_paused", count = paused).into_owned()
             }
         });
-    let context = match loop_chip {
-        Some(chip) => format!("{context} | {chip}"),
-        None => context,
-    };
+
     let work = status_bar_work_text(app);
     let key_hint = hint_bar_text(hint_bar_model(app));
 
@@ -1940,15 +1911,21 @@ pub(super) fn render_status(app: &AppState, palette: Palette) -> Paragraph<'stat
         Span::styled(policy.to_string(), palette.text().bg(palette.surface_alt)),
         Span::styled(" | ", palette.muted().bg(palette.surface_alt)),
         Span::styled(profile.to_string(), palette.text().bg(palette.surface_alt)),
-        Span::styled(" | ", palette.muted().bg(palette.surface_alt)),
-        Span::styled(context, palette.muted().bg(palette.surface_alt)),
-        Span::styled(" | ", palette.muted().bg(palette.surface_alt)),
-        Span::styled(app.status.clone(), palette.muted().bg(palette.surface_alt)),
-        Span::styled(" | ", palette.muted().bg(palette.surface_alt)),
+        // Declutter (user report): the bar carried three segments nobody could
+        // act on — "N msgs/M tasks" (owned by /context and /ps), the constant
+        // "interactive" mode word (read-only already surfaces as "sends
+        // disabled" in the policy slot), and the active TURN id (developer
+        // debris; "Working" already says a turn is live). The loop chip stays
+        // because a forgotten loop burns tokens invisibly, and the transient
+        // status slot stays because it is every command's feedback channel.
         Span::styled(
-            format!("{mode} {turn}"),
+            loop_chip
+                .map(|chip| format!(" | {chip}"))
+                .unwrap_or_default(),
             palette.muted().bg(palette.surface_alt),
         ),
+        Span::styled(" | ", palette.muted().bg(palette.surface_alt)),
+        Span::styled(app.status.clone(), palette.muted().bg(palette.surface_alt)),
         // The cwd deliberately lives on the composer's bottom border, not here —
         // repeating it one line below the composer read as clutter.
         Span::styled(" | ", palette.muted().bg(palette.surface_alt)),
