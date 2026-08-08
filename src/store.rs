@@ -6316,25 +6316,30 @@ impl Store {
         // Label the card with the cwd the command runs in (#364): the child
         // inherits THIS process's working directory (see the transport's
         // `spawn_local_shell`), so the running chip can already say where.
-        let detail = local_shell_card_detail(cmd, local_shell_cwd_display().as_deref());
-        let mut chip = ActivityItem::new(ActivityKind::Tool, "!", running.clone())
-            .with_detail(detail)
+        // `cmd`/cwd are terminal-tainted input for the transcript — sanitize
+        // at composition (codex on #513: output was sanitized, labels not).
+        let clean_cmd = crate::sanitize::strip_terminal_controls(cmd).into_owned();
+        let detail = local_shell_card_detail(&clean_cmd, local_shell_cwd_display().as_deref());
+        let clean_detail = crate::sanitize::strip_terminal_controls(&detail).into_owned();
+        // The bang is a REPORT for its WHOLE lifecycle (running → settled),
+        // not a Tool chip (codex round on #513). Reports are the
+        // turn-independent client-local output surface: they render idle AND
+        // mid-turn unconditionally, and they are excluded from turn-flow
+        // activity, turn archival, and agent-task action counts — a Tool
+        // chip was invisible idle (turn flow never shows), and attaching it
+        // to the live turn corrupted turn-terminal capture in both orderings
+        // (running chip archived as "interrupted" with the result orphaned;
+        // settled report swept out of live activity by terminal capture).
+        let mut chip = ActivityItem::new(ActivityKind::Report, format!("! {clean_cmd}"), running)
+            .with_detail(clean_detail)
             .with_tool_call(local_id.clone())
             // Sticky: a busy turn's tool flood must not evict the chip before
             // its result lands (same rationale as the compaction notice).
             .with_sticky();
-        // Stamp the session and, when a turn is live, attach that turn — the
-        // transcript's activity filter renders ONLY the live turn's items
-        // mid-turn, so an unattached chip was invisible exactly when bangs
-        // are most used (field report: "! could not execute" — it executed,
-        // the chip and its output just never rendered).
+        // Stamp the session so the report stays out of OTHER sessions'
+        // transcripts; deliberately NO turn attachment (see above).
         if let Some(session) = self.active_session() {
-            let session_id = session.id.clone();
-            let live_turn = session.live_reply.as_ref().map(|live| live.turn_id.clone());
-            chip = chip.with_session(session_id);
-            if let Some(turn_id) = live_turn {
-                chip = chip.with_turn(turn_id);
-            }
+            chip = chip.with_session(session.id.clone());
         }
         self.state.push_activity(chip);
         // Keep the composer focused: the old dispatch parked focus on the
@@ -6365,44 +6370,71 @@ impl Store {
         // transport ACTUALLY ran in (carried on the event); fall back to this
         // process's cwd — same process, so the same directory — when unset.
         let cwd = event.cwd.clone().or_else(local_shell_cwd_display);
-        let detail = local_shell_card_detail(&event.cmdline, cwd.as_deref());
-        self.state.update_tool_activity(
-            &event.local_id,
-            status.clone(),
-            Some(detail.clone()),
-            Some(output.clone()),
-            Some(success),
-            Some(event.duration_ms),
-        );
-        // Convert the settled chip into a REPORT: activity chips render only
-        // inside the turn flow, which an idle session never shows — the
-        // field report's "! could not execute" was a command that ran with
-        // its output rendered nowhere. Reports are the turn-independent
-        // client-local output surface (the `/loop list` precedent), visible
-        // idle and mid-turn alike. Retain only the LATEST bang report so
-        // repeated commands don't pin an unbounded stack of output blocks
-        // into the live tail.
+        // cmdline/cwd are terminal-tainted; sanitize at composition like the
+        // output (codex on #513).
+        let clean_cmd = crate::sanitize::strip_terminal_controls(&event.cmdline).into_owned();
+        let detail = local_shell_card_detail(&clean_cmd, cwd.as_deref());
+        let clean_detail = crate::sanitize::strip_terminal_controls(&detail).into_owned();
         let sanitized_output = crate::sanitize::strip_terminal_controls(&output).into_owned();
-        self.state.activity.retain(|item| {
-            !(item.kind == ActivityKind::Report
-                && item
-                    .tool_call_id
-                    .as_deref()
-                    .is_some_and(|id| id.starts_with("local-shell:"))
-                && item.tool_call_id.as_deref() != Some(event.local_id.as_str()))
-        });
-        if let Some(item) = self
+        let report_title = format!("! {clean_cmd}");
+        let report_detail = format!("{clean_detail}\n{sanitized_output}");
+
+        // Settle the running report IN PLACE — or, when its chip is gone
+        // (evicted by the activity cap, or dropped by a snapshot rebuild
+        // mid-run — codex on #513), push a FALLBACK report so the output is
+        // never silently lost.
+        let settled_session = if let Some(item) = self
             .state
             .activity
             .iter_mut()
             .rev()
             .find(|item| item.tool_call_id.as_deref() == Some(event.local_id.as_str()))
         {
-            item.kind = ActivityKind::Report;
-            item.title = format!("! {}", event.cmdline);
-            item.detail = Some(format!("{detail}\n{sanitized_output}"));
-        }
-        self.state.status = format!("! {} ({status})", event.cmdline);
+            item.status = status.clone();
+            item.success = Some(success);
+            item.duration_ms = Some(event.duration_ms);
+            item.title = report_title;
+            item.detail = Some(report_detail);
+            item.output_preview = Some(sanitized_output);
+            item.session_id.clone()
+        } else {
+            let mut fallback =
+                ActivityItem::new(ActivityKind::Report, report_title, status.clone())
+                    .with_detail(report_detail)
+                    .with_tool_call(event.local_id.clone())
+                    .with_sticky();
+            let session_id = self.active_session().map(|session| session.id.clone());
+            if let Some(session_id) = session_id.clone() {
+                fallback = fallback.with_session(session_id);
+            }
+            let mut fallback = fallback;
+            fallback.success = Some(success);
+            fallback.duration_ms = Some(event.duration_ms);
+            self.state.push_activity(fallback);
+            session_id
+        };
+
+        // Retention: keep only the LATEST SETTLED bang report PER SESSION so
+        // repeated commands don't pin an unbounded stack of output blocks
+        // into the live tail. Codex on #513 refuted the first cut here:
+        // pruning ran BEFORE the completing chip was located (a late result
+        // for an evicted chip deleted another bang's report and produced
+        // nothing), it was global (a background session's completion deleted
+        // the FOCUSED session's report), and it matched on kind alone.
+        // Now: runs after settle, scoped to the completing report's session,
+        // and spares in-flight reports structurally (`success.is_none()` —
+        // never a localized status-string match).
+        self.state.activity.retain(|item| {
+            let is_other_settled_bang_report = item.kind == ActivityKind::Report
+                && item.success.is_some()
+                && item
+                    .tool_call_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with("local-shell:"))
+                && item.tool_call_id.as_deref() != Some(event.local_id.as_str());
+            !(is_other_settled_bang_report && item.session_id == settled_session)
+        });
+        self.state.status = format!("! {clean_cmd} ({status})");
         self.state.scroll_transcript_to_latest();
     }
 
@@ -10241,10 +10273,16 @@ impl Store {
                 .map(|live_reply| live_reply.turn_id.clone());
             if let (Some(turn_id), Some(current_turn)) = (event.turn_id.clone(), current_turn) {
                 if turn_id == current_turn {
+                    // The word normally arrives in `label` (the pinned
+                    // server's rotator shape); accept `message` as fallback
+                    // so a message-only status_word is stored rather than
+                    // silently dropped (codex on #512: with the status-line
+                    // gate, a message-only word had NO surface at all).
                     match event
                         .metadata
                         .label
                         .as_deref()
+                        .or(event.metadata.message.as_deref())
                         .map(str::trim)
                         .filter(|word| !word.is_empty())
                     {
@@ -25915,11 +25953,13 @@ now analyzing the bus module"
         assert!(store.state.sessions[0].messages.is_empty());
         assert!(store.state.optimistic_user_messages.is_empty());
         assert!(store.state.pending_messages.is_empty());
-        // A "running" Tool chip stamped with the local id, labeled with the
-        // cwd the command runs in (#364 — the TUI process cwd).
+        // A "running" REPORT stamped with the local id, labeled with the
+        // cwd the command runs in (#364 — the TUI process cwd). Report, not
+        // Tool: reports are the only surface that renders idle AND mid-turn
+        // without turn attachment (codex on #513).
         let chip = store.state.activity.last().expect("running activity chip");
-        assert_eq!(chip.kind, ActivityKind::Tool);
-        assert_eq!(chip.title, "!");
+        assert_eq!(chip.kind, ActivityKind::Report);
+        assert_eq!(chip.title, "! echo hi");
         assert_eq!(chip.status, "running");
         let detail = chip.detail.as_deref().expect("running chip detail");
         assert!(detail.starts_with("echo hi"), "detail: {detail}");
@@ -32885,19 +32925,124 @@ now analyzing the bus module"
             .state
             .activity
             .last()
-            .expect("bang dispatch pushes a running chip");
+            .expect("bang dispatch pushes a running report");
+        assert_eq!(
+            chip.kind,
+            ActivityKind::Report,
+            "the bang is a REPORT for its whole lifecycle: reports render \
+             idle AND mid-turn unconditionally, and stay out of turn \
+             archival and agent-task action counts (codex on #513)"
+        );
         assert_eq!(
             chip.session_id.as_ref(),
             Some(&session_id),
-            "the chip must be stamped with the session it ran from"
+            "the report must be stamped with the session it ran from"
         );
         assert_eq!(
-            chip.turn_id.as_ref(),
-            Some(&turn),
-            "mid-turn, the chip must attach to the live turn or the \
-             turn-scoped activity filter hides it while it runs"
+            chip.turn_id, None,
+            "deliberately NO turn attachment — attaching local work to a \
+             real agent turn corrupted turn-terminal capture in both \
+             orderings (codex on #513)"
         );
         assert!(chip.sticky, "must survive a busy turn's activity eviction");
+        let _ = turn;
+    }
+
+    #[test]
+    fn completing_bang_never_prunes_a_running_or_foreign_report() {
+        // codex on #513: retention was global and kind-only — a background
+        // session's completion deleted the FOCUSED session's report, and a
+        // late completion could prune reports before its own chip was found.
+        // Retention is now session-scoped and spares in-flight reports
+        // structurally (success.is_none()).
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let session_a = store.state.sessions[0].id.clone();
+        let session_b = store.state.sessions[1].id.clone();
+
+        // A settled report in session B (as if a bang completed there).
+        let mut foreign = ActivityItem::new(ActivityKind::Report, "! b-cmd", "complete")
+            .with_tool_call("local-shell:b-1")
+            .with_session(session_b.clone());
+        foreign.success = Some(true);
+        store.state.push_activity(foreign);
+
+        // A RUNNING bang report in session A.
+        let running = ActivityItem::new(ActivityKind::Report, "! slow", "running")
+            .with_tool_call("local-shell:a-slow")
+            .with_session(session_a.clone());
+        store.state.push_activity(running);
+
+        // A second bang in session A completes.
+        let quick = ActivityItem::new(ActivityKind::Report, "! quick", "running")
+            .with_tool_call("local-shell:a-quick")
+            .with_session(session_a.clone());
+        store.state.push_activity(quick);
+        store.apply_client_event(ClientEvent::LocalShellResult(
+            crate::client_event::LocalShellResultEvent {
+                local_id: "local-shell:a-quick".into(),
+                cmdline: "quick".into(),
+                cwd: None,
+                stdout: "done\n".into(),
+                stderr: String::new(),
+                exit_code: Some(0),
+                duration_ms: 1,
+                truncated: false,
+            },
+        ));
+
+        let ids: Vec<_> = store
+            .state
+            .activity
+            .iter()
+            .filter_map(|item| item.tool_call_id.as_deref())
+            .collect();
+        assert!(
+            ids.contains(&"local-shell:b-1"),
+            "another session's report must survive a completion elsewhere"
+        );
+        assert!(
+            ids.contains(&"local-shell:a-slow"),
+            "a RUNNING report must never be pruned by a completing sibling"
+        );
+        assert!(ids.contains(&"local-shell:a-quick"));
+    }
+
+    #[test]
+    fn late_result_for_a_missing_chip_lands_as_a_fallback_report() {
+        // codex on #513: an evicted chip's late result deleted another
+        // bang's report and produced NOTHING. Now the result finds no chip
+        // and pushes a fallback report instead of pruning blind.
+        let mut store = store_with_empty_session();
+        store.apply_client_event(ClientEvent::LocalShellResult(
+            crate::client_event::LocalShellResultEvent {
+                local_id: "local-shell:evicted".into(),
+                cmdline: "echo late".into(),
+                cwd: None,
+                stdout: "late-output\n".into(),
+                stderr: String::new(),
+                exit_code: Some(0),
+                duration_ms: 7,
+                truncated: false,
+            },
+        ));
+        let report = store
+            .state
+            .activity
+            .iter()
+            .rev()
+            .find(|item| item.tool_call_id.as_deref() == Some("local-shell:evicted"))
+            .expect("a fallback report must be pushed for a missing chip");
+        assert_eq!(report.kind, ActivityKind::Report);
+        assert_eq!(report.title, "! echo late");
+        assert!(
+            report
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("late-output"),
+            "the fallback must carry the output"
+        );
+        assert_eq!(report.success, Some(true));
     }
 
     #[test]
