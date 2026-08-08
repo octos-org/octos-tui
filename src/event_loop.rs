@@ -6104,8 +6104,8 @@ mod tests {
         assert!(matches!(first, AppUiCommand::LocalShellExec { .. }));
         assert_eq!(
             store.state.focus,
-            FocusPane::Tasks,
-            "precondition: the first bang parked focus on the Tasks dock"
+            FocusPane::Composer,
+            "a bang keeps the composer focused (the Tasks dock cannot show its result)"
         );
 
         handle_key(&mut store, key(KeyCode::Char('!')));

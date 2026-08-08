@@ -6317,12 +6317,30 @@ impl Store {
         // inherits THIS process's working directory (see the transport's
         // `spawn_local_shell`), so the running chip can already say where.
         let detail = local_shell_card_detail(cmd, local_shell_cwd_display().as_deref());
-        self.state.push_activity(
-            ActivityItem::new(ActivityKind::Tool, "!", running.clone())
-                .with_detail(detail)
-                .with_tool_call(local_id.clone()),
-        );
-        self.state.focus = FocusPane::Tasks;
+        let mut chip = ActivityItem::new(ActivityKind::Tool, "!", running.clone())
+            .with_detail(detail)
+            .with_tool_call(local_id.clone())
+            // Sticky: a busy turn's tool flood must not evict the chip before
+            // its result lands (same rationale as the compaction notice).
+            .with_sticky();
+        // Stamp the session and, when a turn is live, attach that turn — the
+        // transcript's activity filter renders ONLY the live turn's items
+        // mid-turn, so an unattached chip was invisible exactly when bangs
+        // are most used (field report: "! could not execute" — it executed,
+        // the chip and its output just never rendered).
+        if let Some(session) = self.active_session() {
+            let session_id = session.id.clone();
+            let live_turn = session.live_reply.as_ref().map(|live| live.turn_id.clone());
+            chip = chip.with_session(session_id);
+            if let Some(turn_id) = live_turn {
+                chip = chip.with_turn(turn_id);
+            }
+        }
+        self.state.push_activity(chip);
+        // Keep the composer focused: the old dispatch parked focus on the
+        // Tasks dock, which shows "No tasks yet" for a bang (it is an
+        // activity chip, not a task) — an empty pane where the user expected
+        // output.
         self.state.status = format!("! {cmd}");
         self.state.scroll_transcript_to_latest();
 
@@ -6351,11 +6369,39 @@ impl Store {
         self.state.update_tool_activity(
             &event.local_id,
             status.clone(),
-            Some(detail),
-            Some(output),
+            Some(detail.clone()),
+            Some(output.clone()),
             Some(success),
             Some(event.duration_ms),
         );
+        // Convert the settled chip into a REPORT: activity chips render only
+        // inside the turn flow, which an idle session never shows — the
+        // field report's "! could not execute" was a command that ran with
+        // its output rendered nowhere. Reports are the turn-independent
+        // client-local output surface (the `/loop list` precedent), visible
+        // idle and mid-turn alike. Retain only the LATEST bang report so
+        // repeated commands don't pin an unbounded stack of output blocks
+        // into the live tail.
+        let sanitized_output = crate::sanitize::strip_terminal_controls(&output).into_owned();
+        self.state.activity.retain(|item| {
+            !(item.kind == ActivityKind::Report
+                && item
+                    .tool_call_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with("local-shell:"))
+                && item.tool_call_id.as_deref() != Some(event.local_id.as_str()))
+        });
+        if let Some(item) = self
+            .state
+            .activity
+            .iter_mut()
+            .rev()
+            .find(|item| item.tool_call_id.as_deref() == Some(event.local_id.as_str()))
+        {
+            item.kind = ActivityKind::Report;
+            item.title = format!("! {}", event.cmdline);
+            item.detail = Some(format!("{detail}\n{sanitized_output}"));
+        }
         self.state.status = format!("! {} ({status})", event.cmdline);
         self.state.scroll_transcript_to_latest();
     }
@@ -25986,12 +26032,58 @@ now analyzing the bus module"
         assert_eq!(chip.success, Some(true));
         assert_eq!(chip.duration_ms, Some(12));
         assert_eq!(chip.output_preview.as_deref(), Some("hi\n"));
-        // The completed card is labeled with the cwd the transport ran in.
+        // The settled result converts to a turn-independent REPORT (the
+        // `/loop list` precedent): activity chips render only inside the
+        // turn flow, which an idle session never shows — pre-fix the output
+        // rendered NOWHERE ("! could not execute" field report).
+        assert_eq!(chip.kind, ActivityKind::Report);
+        assert_eq!(chip.title, "! echo hi");
         assert_eq!(
             chip.detail.as_deref(),
-            Some("echo hi · cwd: /tmp/workdir"),
-            "completed card labels the transport-reported cwd"
+            Some("echo hi · cwd: /tmp/workdir\nhi\n"),
+            "the report carries the cwd label AND the output"
         );
+    }
+
+    #[test]
+    fn repeated_bangs_retain_only_the_latest_report() {
+        // Reports pin into the live tail; an unbounded stack of bang outputs
+        // would bloat the viewport, so only the LATEST result is retained
+        // (running chips are untouched — this prunes settled reports only).
+        let mut store = store_with_empty_session();
+        for (i, cmd) in ["!echo one", "!echo two"].iter().enumerate() {
+            store.state.set_composer_text(*cmd);
+            let local_id = match store.compose_command().expect("dispatch") {
+                AppUiCommand::LocalShellExec { local_id, .. } => local_id,
+                other => panic!("expected LocalShellExec, got {other:?}"),
+            };
+            store.apply_client_event(ClientEvent::LocalShellResult(
+                crate::client_event::LocalShellResultEvent {
+                    local_id,
+                    cmdline: cmd.trim_start_matches('!').to_string(),
+                    cwd: None,
+                    stdout: format!("out-{i}\n"),
+                    stderr: String::new(),
+                    exit_code: Some(0),
+                    duration_ms: 1,
+                    truncated: false,
+                },
+            ));
+        }
+        let bang_reports: Vec<_> = store
+            .state
+            .activity
+            .iter()
+            .filter(|item| {
+                item.kind == ActivityKind::Report
+                    && item
+                        .tool_call_id
+                        .as_deref()
+                        .is_some_and(|id| id.starts_with("local-shell:"))
+            })
+            .collect();
+        assert_eq!(bang_reports.len(), 1, "only the latest bang report stays");
+        assert_eq!(bang_reports[0].title, "! echo two");
     }
 
     #[test]
@@ -32763,6 +32855,66 @@ now analyzing the bus module"
                 .last()
                 .and_then(|activity| activity.detail.as_deref()),
             Some("modify src/lib.rs | diff preview ready")
+        );
+    }
+
+    #[test]
+    fn bang_chip_is_stamped_and_visible_where_the_user_looks() {
+        // Field report 2026-08-08 ("! could not execute"): the command RAN,
+        // but the running/complete chip was pushed session-unstamped and
+        // turn-unattached, so the transcript's activity filter hid it in
+        // exactly the situations bangs get used — mid-turn (only the live
+        // turn's items render) and fresh sessions (welcome screen). The user
+        // saw a cleared composer and no output: indistinguishable from "did
+        // not execute". The chip must carry the active session and, when a
+        // turn is live, that turn — the same attachment the compaction
+        // notice uses for the same reason.
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        let turn = TurnId::new();
+        store.state.sessions[0].live_reply = Some(LiveReply {
+            turn_id: turn.clone(),
+            text: String::new(),
+        });
+
+        store.state.set_composer_text("!echo hi");
+        let cmd = store.compose_command();
+        assert!(matches!(cmd, Some(AppUiCommand::LocalShellExec { .. })));
+
+        let chip = store
+            .state
+            .activity
+            .last()
+            .expect("bang dispatch pushes a running chip");
+        assert_eq!(
+            chip.session_id.as_ref(),
+            Some(&session_id),
+            "the chip must be stamped with the session it ran from"
+        );
+        assert_eq!(
+            chip.turn_id.as_ref(),
+            Some(&turn),
+            "mid-turn, the chip must attach to the live turn or the \
+             turn-scoped activity filter hides it while it runs"
+        );
+        assert!(chip.sticky, "must survive a busy turn's activity eviction");
+    }
+
+    #[test]
+    fn bang_dispatch_keeps_the_composer_focused() {
+        // The old dispatch parked focus on the Tasks dock — which shows "No
+        // tasks yet" for a bang (it is an activity chip, not a task), so the
+        // user stared at an empty pane while the output rendered elsewhere.
+        let mut store = store_with_empty_session();
+        store.state.focus = FocusPane::Composer;
+
+        store.state.set_composer_text("!pwd");
+        let cmd = store.compose_command();
+        assert!(matches!(cmd, Some(AppUiCommand::LocalShellExec { .. })));
+        assert_eq!(
+            store.state.focus,
+            FocusPane::Composer,
+            "a bang must not steal focus to a pane that cannot show its result"
         );
     }
 

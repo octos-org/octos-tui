@@ -994,9 +994,14 @@ fn is_running_activity(item: &ActivityItem) -> bool {
 
 /// True for a fresh session that has no messages yet — where we show the launch
 /// banner at the top of the transcript area (it scrolls away on the first turn).
+/// Visible client-local content dismisses it too: a `/loop list` report or a
+/// `!`-bang shell chip in a fresh session must render instead of being covered
+/// by the banner (field report: a bang's output was invisible in a new
+/// session, reading as "the command did not execute").
 fn launch_banner_active(app: &AppState) -> bool {
     app.pending_messages.is_empty()
         && flow_report_items(app).is_empty()
+        && flow_activity_items(app).is_empty()
         && app
             .active_session()
             .is_some_and(|session| session.messages.is_empty() && session.live_reply.is_none())
