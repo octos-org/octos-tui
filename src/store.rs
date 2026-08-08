@@ -10236,7 +10236,16 @@ impl Store {
             return None;
         }
 
-        if !is_noisy_progress_status(&status) && !progress_metadata_is_bare_kind(&event.metadata) {
+        // The persona status word's home is the HARNESS line (stored in
+        // `session_status_word` above, where it replaces the Working phase).
+        // It carries its word in `label`, so it is not bare-kind — exclude it
+        // here explicitly or the same word renders on two lines at once.
+        let is_status_word =
+            event.metadata.kind == octos_core::ui_protocol::progress_kinds::STATUS_WORD;
+        if !is_status_word
+            && !is_noisy_progress_status(&status)
+            && !progress_metadata_is_bare_kind(&event.metadata)
+        {
             self.state.status = status;
         }
         None
@@ -32758,6 +32767,46 @@ now analyzing the bus module"
     }
 
     #[test]
+    fn status_word_progress_does_not_clobber_the_status_line() {
+        // `state ✧ Working (…) | dev | 整活中 | …` (user feedback 2026-08-08):
+        // the persona word's home is the HARNESS line (via
+        // `session_status_word`, where it replaces the Working phase). A
+        // status_word event carries the word in `label`, so it is NOT
+        // bare-kind — it must still never land in `state.status`, or the same
+        // word renders on two lines at once.
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        let turn = TurnId::new();
+        store.state.sessions[0].live_reply = Some(LiveReply {
+            turn_id: turn.clone(),
+            text: String::new(),
+        });
+        store.state.status = "ready".into();
+
+        let mut meta = UiProgressMetadata::new(progress_kinds::STATUS_WORD);
+        meta.label = Some("整活中".into());
+        store.apply_event(AppUiEvent::Progress(UiProgressEvent::new(
+            session_id.clone(),
+            Some(turn.clone()),
+            meta,
+        )));
+
+        assert_eq!(
+            store
+                .state
+                .session_status_word
+                .get(&session_id)
+                .map(|(_, w)| w.as_str()),
+            Some("整活中"),
+            "the word must still reach its harness-line home"
+        );
+        assert_eq!(
+            store.state.status, "ready",
+            "a status_word event must not overwrite the status line"
+        );
+    }
+
+    #[test]
     fn bare_kind_progress_does_not_clobber_the_status_line() {
         // `Progress: thinking` next to the Working spinner is double
         // narration (user feedback 2026-08-08): a progress event whose
@@ -32892,19 +32941,27 @@ now analyzing the bus module"
     }
 
     #[test]
-    fn status_word_persona_spinner_updates_status_without_activity() {
+    fn status_word_persona_spinner_touches_neither_status_nor_activity() {
         let mut store = store_with_empty_session();
         let session_id = store.state.sessions[0].id.clone();
-        // Persona spinner: kind="status_word", dynamic label (LLM-generated). It
-        // must update the status line but NOT pile up as counted activity actions
-        // (otherwise the agent-task chip shows "N active" with no real work).
+        store.state.status = "ready".into();
+        // Persona spinner: kind="status_word", dynamic word (LLM-generated).
+        // Its home is the HARNESS line via `session_status_word`; it must not
+        // pile up as counted activity actions (fake "N active" chips) AND —
+        // superseding this test's original contract (user feedback
+        // 2026-08-08) — it must not overwrite the status line either, or the
+        // word renders on two lines at once. This holds whether the word
+        // arrives in `label` or `message`.
         store.apply_event(AppUiEvent::Progress(UiProgressEvent::new(
             session_id,
             Some(TurnId::new()),
             UiProgressMetadata::new(progress_kinds::STATUS_WORD).with_message("Composing"),
         )));
 
-        assert_eq!(store.state.status, "Composing");
+        assert_eq!(
+            store.state.status, "ready",
+            "status_word must not overwrite the status line"
+        );
         assert!(
             store.state.activity.is_empty(),
             "status_word spinner must not be recorded as activity"
