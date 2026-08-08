@@ -6407,7 +6407,6 @@ impl Store {
             if let Some(session_id) = session_id.clone() {
                 fallback = fallback.with_session(session_id);
             }
-            let mut fallback = fallback;
             fallback.success = Some(success);
             fallback.duration_ms = Some(event.duration_ms);
             self.state.push_activity(fallback);
